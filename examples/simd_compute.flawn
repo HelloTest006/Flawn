@@ -1,0 +1,26 @@
+// High-Performance Backend & SIMD Compute Pipeline in Flawn
+@simd @parallel @fastmath
+fn backend_score_batch(weights: f32[], features: f32[], n: usize) -> f64 {
+    let score: f64 = 0.0;
+    for (let i: usize = 0; i < n; i++) {
+        score += weights[i] * features[i];
+    }
+    return score;
+}
+
+fn main() -> void {
+    const batch_size: usize = 8_388_608;
+    let weights: f32[] = f32[batch_size];
+    let features: f32[] = f32[batch_size];
+    fill_seq_f32(weights, 0.0005, batch_size);
+    fill_seq_f32(features, 0.0005, batch_size);
+
+    let start_ms: f64 = clock_ms();
+    let total_score: f64 = backend_score_batch(weights, features, batch_size);
+    let elapsed_ms: f64 = clock_ms() - start_ms;
+
+    print("Backend Batch Elements :", batch_size);
+    print("Computed Batch Score   :", total_score);
+    print("Kernel Execution (ms)  :", elapsed_ms);
+    print("Arena Footprint (KB)   :", arena_kb());
+}

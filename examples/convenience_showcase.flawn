@@ -1,0 +1,59 @@
+// Showcase of Flawn's Everyday Developer Convenience + High-Performance Ergonomics
+import math
+import json
+import crypto
+
+// 1. Zero-ceremony Structs with default field values
+struct ServiceConfig {
+    host: str = "127.0.0.1",
+    port: i64 = 8080,
+    workers: i64 = 4
+}
+
+// 2. Concise single-expression arrow functions (`=>`) + default parameters
+fn apply_tax(amount: f64, rate: f64 = 0.08) => amount * (1.0 + rate);
+fn apply_discount(amount: f64, off: f64 = 15.0) => amount - off;
+fn round_cents(amount: f64) => math.round(amount * 100.0) / 100.0;
+
+// 3. Seamless Python `def` in the same file
+def python_fibonacci(n):
+    a = 0
+    b = 1
+    for i in range(n):
+        temp = a + b
+        a = b
+        b = temp
+    return a
+
+fn main() -> void {
+    print("=== Flawn Ergonomics & Convenience Showcase ===");
+
+    // Struct instantiation & JS/Python string interpolation (`f"..."` and `` `...${x}...` ``)
+    let cfg = ServiceConfig { host: "0.0.0.0", port: 9090 };
+    print(f"Server listening on {cfg.host}:{cfg.port} with {cfg.workers} workers");
+
+    // Pipe Operator (`|>`) for readable data transformation chains
+    let final_price = 250.0 |> apply_discount(25.0) |> apply_tax(0.10) |> round_cents;
+    print(`Final checkout price: $${final_price}`);
+
+    // Built-in Array literals & SIMD-backed collection methods (`.sum()`, `.mean()`, `.min()`, `.max()`, `.push()`)
+    let latencies = [1.2, 0.8, 1.5, 0.9, 1.1];
+    latencies.push(0.5);
+    print(f"Latencies count={latencies.len()}, sum={latencies.sum()}, mean={latencies.mean()} ms, min={latencies.min()} ms, max={latencies.max()} ms");
+
+    // Ergonomic Range operator `0..=5` & `for x in array`
+    let sq_sum = 0;
+    for i in 1..=5 {
+        sq_sum += i * i;
+    }
+    print(f"Sum of squares (1..=5) = {sq_sum}");
+
+    // Dictionary / Map literals & JSON serialization
+    let payload = {
+        "service": "flawn-api",
+        "status": "healthy",
+        "fib_20": python_fibonacci(20),
+        "hash": crypto.fnv1a64("flawn-api")
+    };
+    print("JSON Payload:", json.stringify(payload));
+}

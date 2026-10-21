@@ -1,0 +1,12 @@
+# Build artifacts & generated binaries
+build/
+*.exe
+*.gen.cpp
+*.o
+*.obj
+*.dll
+*.so
+*.dylib
+__pycache__/
+.vscode/
+.idea/

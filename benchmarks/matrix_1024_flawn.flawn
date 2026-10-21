@@ -1,0 +1,90 @@
+// Flawn 1024x1024 Matrix Benchmark (WITHOUT NumPy via Native @simd @parallel vs WITH NumPy via CPython Bridge)
+import numpy
+
+@simd @parallel @fastmath
+fn flawn_fused_matrix_1024(A: f32[], B: f32[], C: f32[], n: usize) -> f64 {
+    return matrix_fused_f32(A, B, C, n);
+}
+
+@simd @parallel @fastmath
+fn flawn_matmul_1024(A: f32[], B: f32[], C: f32[], n: usize) -> f64 {
+    return matrix_matmul_f32(A, B, C, n);
+}
+
+fn main() -> void {
+    const N: usize = 1024;
+    const total_elems: usize = 1048576; // 1024 * 1024
+
+    print("========================================================================");
+    print("  FLAWN BENCHMARK: 1024x1024 MATRIX PROCESSING (WITHOUT & WITH NUMPY)");
+    print("========================================================================");
+
+    // 1. Allocate 64-byte aligned SlabArena matrices A, B, C (4 MB each = 12 MB total)
+    let t_init0: f64 = clock_ms();
+    let A: f32[] = f32[total_elems];
+    let B: f32[] = f32[total_elems];
+    let C: f32[] = f32[total_elems];
+    init_matrix_ab_f32(A, B, N);
+    let t_init1: f64 = clock_ms();
+    print("[Init] Flawn 64B-Aligned 1024x1024 Arena Matrices Created in", t_init1 - t_init0, "ms");
+    print("[Init] Total Arena RAM Used:", arena_kb(), "KB");
+
+    // 2. Initialize identical 1024x1024 NumPy arrays inside Flawn's CPython 3.14 bridge
+    py_exec("import numpy as np, time");
+    py_exec("N = 1024; SCALE = 1.0 / 256.0");
+    py_exec("ii, jj = np.meshgrid(np.arange(N, dtype=np.int64), np.arange(N, dtype=np.int64), indexing='ij')");
+    py_exec("A_np32 = (((ii * 7 + jj * 13) & 255) * SCALE).astype(np.float32)");
+    py_exec("B_np32 = (((ii * 11 + jj * 5) & 255) * SCALE).astype(np.float32)");
+
+    // ------------------------------------------------------------------------
+    // WORKLOAD A: 1024x1024 Fused Matrix Transform & Reduction
+    // C[i,j] = (A[i,j] * B[i,j] + 0.5 * A[i,j]) - 0.25 * B[i,j]
+    // ------------------------------------------------------------------------
+    print("--- Workload A: 1024x1024 Fused Matrix Transform & Sum ---");
+
+    // Warmup Native Flawn
+    let warmup_elem: f64 = flawn_fused_matrix_1024(A, B, C, N);
+
+    let iters_elem: i64 = 20;
+    let t_f0: f64 = clock_ms();
+    let flawn_elem_sum: f64 = 0.0;
+    for (let it: i64 = 0; it < iters_elem; it++) {
+        flawn_elem_sum = flawn_fused_matrix_1024(A, B, C, N);
+    }
+    let t_f1: f64 = clock_ms();
+    let flawn_no_numpy_elem_ms: f64 = (t_f1 - t_f0) / 20.0;
+
+    // Flawn WITH NumPy (calling NumPy vectorized expression via CPython bridge)
+    py_exec("t0 = time.perf_counter()\nfor _ in range(20):\n    C_np32 = (A_np32 * B_np32 + np.float32(0.5) * A_np32) - np.float32(0.25) * B_np32\n    flawn_np_elem_sum = float(np.sum(C_np32, dtype=np.float64))\nflawn_np_elem_ms = ((time.perf_counter() - t0) * 1000.0) / 20.0");
+    let flawn_with_numpy_elem_ms: f64 = py_eval_f64("flawn_np_elem_ms");
+    let flawn_with_numpy_elem_sum: f64 = py_eval_f64("flawn_np_elem_sum");
+
+    print("  [Flawn WITHOUT NumPy (@simd)] Time (ms):", flawn_no_numpy_elem_ms, "| Checksum:", flawn_elem_sum);
+    print("  [Flawn WITH NumPy Bridge]     Time (ms):", flawn_with_numpy_elem_ms, "| Checksum:", flawn_with_numpy_elem_sum);
+
+    // ------------------------------------------------------------------------
+    // WORKLOAD B: 1024x1024 Matrix Multiplication (C = A @ B, 2.15 Billion FLOPs)
+    // ------------------------------------------------------------------------
+    print("--- Workload B: 1024x1024 Matrix Multiplication (C = A @ B) ---");
+
+    // Warmup Native Flawn SGEMM
+    let warmup_mm: f64 = flawn_matmul_1024(A, B, C, N);
+
+    let iters_mm: i64 = 10;
+    let t_m0: f64 = clock_ms();
+    let flawn_mm_sum: f64 = 0.0;
+    for (let it2: i64 = 0; it2 < iters_mm; it2++) {
+        flawn_mm_sum = flawn_matmul_1024(A, B, C, N);
+    }
+    let t_m1: f64 = clock_ms();
+    let flawn_no_numpy_mm_ms: f64 = (t_m1 - t_m0) / 10.0;
+
+    // Flawn WITH NumPy (`A_np32 @ B_np32` via CPython bridge)
+    py_exec("_ = A_np32 @ B_np32\nt0 = time.perf_counter()\nfor _ in range(10):\n    C_mm32 = A_np32 @ B_np32\nflawn_np_mm_ms = ((time.perf_counter() - t0) * 1000.0) / 10.0\nflawn_np_mm_sum = float(np.sum(C_mm32, dtype=np.float64))");
+    let flawn_with_numpy_mm_ms: f64 = py_eval_f64("flawn_np_mm_ms");
+    let flawn_with_numpy_mm_sum: f64 = py_eval_f64("flawn_np_mm_sum");
+
+    print("  [Flawn WITHOUT NumPy (@simd)] Time (ms):", flawn_no_numpy_mm_ms, "| Checksum:", flawn_mm_sum);
+    print("  [Flawn WITH NumPy Bridge]     Time (ms):", flawn_with_numpy_mm_ms, "| Checksum:", flawn_with_numpy_mm_sum);
+    print("========================================================================");
+}

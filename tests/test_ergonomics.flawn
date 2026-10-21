@@ -1,0 +1,37 @@
+// Test 1: Core Ergonomics, Pipe Operator, Ranges, Ternary, Null-Coalescing, F-Strings
+fn double_it(x: i64) => x * 2;
+fn add_num(x: i64, y: i64 = 5) => x + y;
+
+fn main() -> void {
+    // 1. Pipe operator
+    let res = 10 |> double_it |> add_num(7);
+    assert res == 27, "Pipe operator calculation failed";
+
+    // 2. Inclusive and exclusive ranges
+    let s1 = 0;
+    for i in 0..5 {
+        s1 += i;
+    }
+    assert s1 == 10, "Exclusive range 0..5 failed";
+
+    let s2 = 0;
+    for i in 1..=4 {
+        s2 += i;
+    }
+    assert s2 == 10, "Inclusive range 1..=4 failed";
+
+    // 3. Ternary (both C++/JS `? :` and Python `if else`) & Null coalescing (`??`)
+    let mode = (res > 20) ? "fast" : "slow";
+    assert mode == "fast", "C++/JS ternary failed";
+
+    let py_mode = 100 if res == 27 else 0;
+    assert py_mode == 100, "Python ternary failed";
+
+    let fallback = null ?? 42;
+    assert fallback == 42, "Null coalescing operator failed";
+
+    // 4. String interpolation & methods
+    let msg = f"Mode is {mode.upper()}!";
+    assert msg == "Mode is FAST!", "F-string or .upper() failed";
+    assert msg.contains("FAST"), "String .contains() failed";
+}

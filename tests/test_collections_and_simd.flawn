@@ -1,0 +1,57 @@
+// Test 2: Structs, Maps/Dicts, Arrays, SIMD Kernels & Python Superset Interop
+import math
+
+struct Vector2D {
+    x: f64 = 0.0,
+    y: f64 = 0.0
+}
+
+def py_factorial(n):
+    acc = 1
+    for i in range(1, n + 1):
+        acc *= i
+    return acc
+
+@simd @parallel
+fn simd_dot_test(a: f32[], b: f32[], n: usize) -> f64 {
+    let total: f64 = 0.0;
+    for (let i: usize = 0; i < n; i++) {
+        total += a[i] * b[i];
+    }
+    return total;
+}
+
+fn main() -> void {
+    // 1. Struct instantiation & mutation
+    let v = Vector2D { x: 3.0, y: 4.0 };
+    let mag = math.hypot(v.x, v.y);
+    assert mag == 5.0, "Struct + math.hypot failed";
+
+    // 2. Array literal & collection methods
+    let arr = [2.0, 4.0, 6.0, 8.0];
+    assert arr.len() == 4, "Array len failed";
+    assert arr.sum() == 20.0, "Array sum failed";
+    assert arr.mean() == 5.0, "Array mean failed";
+    arr.push(10.0);
+    assert arr.len() == 5, "Array push failed";
+    assert arr[-1] == 10.0, "Negative indexing failed";
+
+    // 3. Dictionary / Map literal
+    let user = { "name": "flawn", "version": 1 };
+    assert user.has("name"), "Map .has() failed";
+    assert user["version"] == 1, "Map indexing failed";
+
+    // 4. Python `def` function
+    assert py_factorial(6) == 720, "Python def factorial failed";
+
+    // 5. SIMD Arena Slice & Kernel
+    let n: usize = 1024;
+    let a: f32[] = f32[n];
+    let b: f32[] = f32[n];
+    for i in 0..n {
+        a[i] = 2.0;
+        b[i] = 3.0;
+    }
+    let d = simd_dot_test(a, b, n);
+    assert d == 6144.0, "SIMD dot product failed";
+}

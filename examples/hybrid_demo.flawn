@@ -1,0 +1,47 @@
+# Hybrid Flawn Program: Standard Python + C++/JS-Style Flawn + Hardware SIMD
+import math
+
+# 1. Standard Unoptimized Python Function (indentation syntax, dynamic types)
+def py_harmonic_workload(n):
+    total = 0
+    for i in range(n):
+        total += i * 3 - (i // 2)
+    return total
+
+// 2. Native Flawn Function (C++/JS syntax, static types, @simd @parallel hardware dispatch)
+@simd @parallel
+fn fast_dot_kernel(a: f32[], b: f32[], n: usize) -> f64 {
+    let acc: f64 = 0.0;
+    for (let i: usize = 0; i < n; i++) {
+        acc += a[i] * b[i];
+    }
+    return acc;
+}
+
+// 3. Main Entrypoint mixing both paradigms seamlessly
+fn main() -> void {
+    print("=== Flawn Unified Dual-Grammar Demo ===");
+
+    // Call Python stdlib package (`math`)
+    let hyp: f64 = math.hypot(3.0, 4.0);
+    print("Python math.hypot(3, 4) =", hyp);
+
+    // Call standard Python `def` function (automatically unboxed & AVX2-lifted by Flawn)
+    let t0: f64 = clock_ms();
+    let py_res: i64 = py_harmonic_workload(10_000_000);
+    let t1: f64 = clock_ms();
+    print("Unoptimized Python def result =", py_res, "in", t1 - t0, "ms");
+
+    // Allocate 64-byte aligned arena slices and run @simd @parallel Flawn kernel
+    let n: usize = 4_194_304;
+    let vec_a: f32[] = f32[n];
+    let vec_b: f32[] = f32[n];
+    fill_seq_f32(vec_a, 0.001, n);
+    fill_seq_f32(vec_b, 0.002, n);
+
+    let t2: f64 = clock_ms();
+    let dot_res: f64 = fast_dot_kernel(vec_a, vec_b, n);
+    let t3: f64 = clock_ms();
+    print("Flawn @simd @parallel dot result =", dot_res, "in", t3 - t2, "ms");
+    print("Slab Arena Memory Used (KB) =", arena_kb());
+}
