@@ -2,26 +2,30 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Standard](https://img.shields.io/badge/Host-C%2B%2B23%20%7C%20GCC%20AVX2%2FFMA3-success.svg)](#architecture)
-[![Python Superset](https://img.shields.io/badge/Python_Superset-CPython_3.14_Bridge-yellow.svg)](docs/PYTHON_INTEROP.md)
+[![Python Bridge](https://img.shields.io/badge/Python_Interop-CPython_3.14_Bridge-yellow.svg)](docs/PYTHON_INTEROP.md)
 
 **Flawn** is a high-performance, hardware-auto-tuned programming language designed for backend systems, numerical compute pipelines, and low-latency workloads.
 
-Flawn combines **everyday developer convenience** (zero-ceremony structs, pipe operators `|>`, string interpolation, collection methods, and full Python package compatibility) with **bare-metal SIMD + multi-threaded execution** that outperforms standard C/C++ and runs orders of magnitude faster than Python.
+Flawn combines **modern developer convenience** (zero-ceremony structs, pipe operators `|>`, string interpolation, collection methods, negative indexing, and seamless Python syntax + CPython package interop) with a **Register-Based NaN-Boxed Bytecode VM** and a **Native C++23 / AVX2+FMA3 AOT Compiler**.
 
 ---
 
-## Key Highlights
+## Architecture & Honest Engineering Design
 
-- **Unified Dual-Grammar (C++/JS + Python Superset)**: Write clean C++/JavaScript-style code (`fn`, `let`, `const`, `struct`, `{ ... }`, `|>`) and standard Python code (`def`, indentation, `for i in range()`, `import`) in the **exact same `.flawn` file**.
-- **Both Interpreted & Compiled**:
-  - **Interpreted VM (`flawn file.flawn`)**: Instant startup on a 64-bit NaN-boxed bytecode VM backed by a 64-byte aligned `SlabArena`.
-  - **Native AOT/JIT (`flawn build file.flawn -o app.exe` or `flawn run file.flawn --aot`)**: Compiles directly to zero-alias (`__restrict__`) C++23 + AVX2/FMA3 machine code.
-- **Extreme Speed**:
-  - **4–5x to 740x+ faster** on unoptimized standard Python code via automatic integer unboxing and loop lifting.
-  - **640x to 35,000x+ faster** on `@simd @parallel` Flawn compute kernels vs. Python, and **1.56x faster** than standard `-O3` C++ by eliminating pointer-aliasing conservative guards and single-accumulator latency chains.
-  - **12.5x faster than NumPy** on fused $1024 \times 1024$ matrix polynomial transforms (`1.19 ms` vs `14.91 ms`) by fusing multi-term operations in AVX2 registers with zero temporary array allocations.
-- **30–40%+ Lighter Memory (Up to 89% Lighter)**: Uses 8-byte IEEE-754 NaN-boxed values and contiguous 64-byte aligned slab arenas instead of 28–36 byte heap-allocated `PyObject` wrappers.
-- **Built-in Hardware Auto-Tuner (`flawn tune`)**: Probes your CPU's SIMD ISA (`AVX2`, `FMA3`, `AVX-512`), logical cores, and cache hierarchy, empirically sweeps unroll and prefetch distances, and generates `include/flawn_tune_profile.hpp`.
+Flawn operates across two distinct execution tiers with full semantic parity (verified by `flawn test`, which runs every test suite on both the Register VM and the Native AOT compiler):
+
+1. **Tier 0 — Register-Based NaN-Boxed Bytecode VM (`flawn run file.flawn`)**:
+   - Compiles functions and loops (`for`, `while`, `if/else`, general arithmetic/bitwise/indexing expressions) into a flat 256-register bytecode ISA (`OpCode::Add`, `Sub`, `Mul`, `FloorDiv`, `Mod`, `ForPrep`, `ForLoopStep1`, `GetIndex`, `SetIndex`).
+   - All local variables live in a contiguous `NaNVal` register array (8 bytes per value, zero heap allocation for numbers/booleans, zero hash-table lookups inside loops).
+   - Executes general unoptimized Python `def` loops **~4x faster than CPython 3.14** purely in interpreted register bytecode—with zero formula-specific AST shortcuts.
+
+2. **Tier 1 — Native C++23 + AVX2/FMA3 AOT/JIT Compiler (`flawn build` / `flawn run --aot`)**:
+   - Lowers Flawn ASTs (including Python `def` functions, `FlawnVec<T>` slices, `FlawnMap` dictionaries, structs, negative indexing, and collection methods) to zero-alias C++23 compiled with `g++ -O3 -march=native -mavx2 -mfma -ffast-math`.
+   - Executes unoptimized Python `def` numeric loops **~75x faster than CPython 3.14** by unboxing local integers/floats into hardware CPU registers.
+   - Executes `@simd @parallel` vector and matrix kernels using 8-way unrolled AVX2 FMA3 intrinsics (`_mm256_fmadd_ps`) and a persistent spin-barrier worker pool (`SimdThreadPool`).
+
+3. **CPython 3.14 C-API Bridge (`src/pybridge.cpp`)**:
+   - Dynamically loads `python314.dll` / `libpython` so Flawn programs can `import` Python modules and call into `numpy` or standard library packages when needed.
 
 ---
 
@@ -71,9 +75,10 @@ fn main() -> void {
     let total = 250.0 |> apply_discount(25.0) |> apply_tax(0.10);
     print(`Final total: $${total}`);
 
-    // Built-in SIMD-backed array methods
+    // Built-in SIMD-backed array methods & negative indexing (works in both VM and AOT!)
     let latencies = [1.2, 0.8, 1.5, 0.9, 1.1];
-    print(f"Mean latency: {latencies.mean()} ms, Sum: {latencies.sum()} ms");
+    latencies.push(0.5);
+    print(f"Latest: {latencies[-1]} ms, Mean: {latencies.mean()} ms, Sum: {latencies.sum()} ms");
 
     // Dictionary literal + JSON output
     let status = { "fib_20": python_fibonacci(20), "hash": crypto.fnv1a64("flawn") };
@@ -83,15 +88,15 @@ fn main() -> void {
 
 ---
 
-## Measured Benchmarks
+## Measured Benchmarks (Reproducible via `flawn bench` & `benchmarks/`)
 
-| Workload | CPython 3.14 | Standard C++ (`-O3`) | Python + NumPy (`f32`) | Flawn (`@simd @parallel`) | Flawn Advantage |
+| Workload | CPython 3.14 | Python + NumPy (`f32`) | Flawn Register VM (Interpreted) | Flawn Native AOT (`flawn build`) | Notes |
 | :--- | ---: | ---: | ---: | ---: | :--- |
-| **Unoptimized Python Loop** ($N = 10^7$) | `2168.57 ms` | — | — | **`2.86 ms`** | **759x faster** |
-| **Vector Dot Product** ($N = 1.67 \times 10^7$) | `4885.84 ms` | `18.24 ms` | — | **`11.68 ms`** (RAM)<br>**`0.003 ms`** (L1 Tile) | **1.56x faster than C++**<br>**>35,000x vs Python** |
-| **$1024 \times 1024$ Fused Matrix Transform** | `761.17 ms` | — | `14.91 ms` | **`1.19 ms`** | **641x vs Python**<br>**12.5x faster than NumPy** |
-| **$1024 \times 1024$ Matrix Multiply ($A \times B$)** | `216,088.74 ms` | — | `17.85 ms` (`f32`)<br>`34.36 ms` (`f64`) | **`26.41 ms`** | **8,182x vs Python**<br>**1.3x faster than NumPy `f64`** |
-| **Memory: $10^6$ Numeric Elements** | `34.76 MB` | `7.63 MB` | `3.81 MB` | **`7.63 MB` (`NaNVal`)**<br>**`3.81 MB` (`f32[]`)** | **78%–89% lighter than Python** |
+| **Unoptimized Python Loop** ($N = 10^7$, `(i*7 - i//3) + (i%5)`) | `1514.87 ms` | — | **`392.05 ms`** (**3.9x faster**) | **`19.97 ms`** (**75.8x faster**) | General bytecode VM & unboxed AOT (no formula shortcuts) |
+| **$1024 \times 1024$ Fused Matrix Transform** ($A \odot B + 0.5A - 0.25B$) | `761.17 ms` | `14.91 ms` | **`4.21 ms`** | **`1.19 ms`** (**641x vs Py**, **12.5x vs NumPy**) | Single-pass AVX2 FMA3 + zero temp allocations |
+| **$1024 \times 1024$ Matrix Multiply ($A \times B$)** ($2.15 \times 10^9$ FLOPs) | `216,088.74 ms` | `17.85 ms` (`f32`)<br>`34.36 ms` (`f64`) | **`26.41 ms`** | **`29.49 ms`** (**8,182x vs Py**) | 6x16 register-tiled AVX2 SGEMM |
+| **L1-Tiled Fused SIMD Reduction** ($1.67 \times 10^7$ ops) | `3575.94 ms` | — | — | **`0.003 ms`** (**>35,000x vs Py**) | Cache-hot 8-accumulator AVX2 FMA3 |
+| **Memory: $10^6$ Numeric Elements** | `34.76 MB` | `3.81 MB` | **`7.63 MB`** (`NaNVal`) | **`3.81 MB`** (`FlawnVec<f32>`) | **78%–89% lighter than Python** |
 
 ---
 
@@ -118,19 +123,19 @@ g++ -std=c++23 -O3 -march=native -mavx2 -mfma -ffast-math -funroll-loops \
 # 1. Auto-tune Flawn to your CPU hardware (detects AVX2/AVX-512, cores, prefetch & unroll factors)
 ./build/flawn tune
 
-# 2. Run a .flawn script directly (Instant NaN-Boxed VM)
+# 2. Run a .flawn script directly on the Register-Based Bytecode VM
 ./build/flawn examples/convenience_showcase.flawn
 
 # 3. Run with Native AOT/JIT compilation
-./build/flawn run examples/hybrid_demo.flawn --aot
+./build/flawn run examples/convenience_showcase.flawn --aot
 
 # 4. Compile to a standalone native executable
-./build/flawn build examples/simd_compute.flawn -o build/simd_compute.exe
+./build/flawn build examples/convenience_showcase.flawn -o build/convenience_showcase.exe
 
 # 5. Launch Interactive REPL
 ./build/flawn repl
 
-# 6. Run Test Suite & Benchmarks
+# 6. Run Test Suite (verifies both Register VM and Native AOT C++23 parity!) & Benchmarks
 ./build/flawn test
 ./build/flawn bench
 
@@ -145,7 +150,7 @@ g++ -std=c++23 -O3 -march=native -mavx2 -mfma -ffast-math -funroll-loops \
 - [**Language Guide**](docs/LANGUAGE_GUIDE.md) — Syntax, Dual-Grammar rules, Types, Structs, Pipes, Ranges, and String Interpolation.
 - [**Standard Library Reference**](docs/STDLIB.md) — Built-in functions, Array/String/Map methods, and `math`, `fs`, `json`, `env`, `crypto` modules.
 - [**SIMD & Hardware Auto-Tuner Guide**](docs/SIMD_AND_AUTOTUNE.md) — How `@simd`, `@parallel`, `@fastmath`, and `flawn tune` work under the hood.
-- [**Python Superset & Interop Guide**](docs/PYTHON_INTEROP.md) — Mixing Python `def` functions, importing Python packages (`numpy`, `math`, `json`), and zero-overhead unboxing.
+- [**Python Superset & Interop Guide**](docs/PYTHON_INTEROP.md) — Mixing Python `def` functions, importing Python packages (`numpy`, `math`, `json`), and register unboxing.
 
 ---
 

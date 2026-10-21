@@ -148,19 +148,23 @@ void Analyzer::inspect_loop_optimizations(Stmt* loop_stmt) {
         stats_.parallel_kernels++;
     }
 
-    // Check if loop body is a dot-product / fused multiply-add reduction `acc += a[i] * b[i]`
-    if (loop_stmt->body.size() == 1) {
+    // Only lift to `simd_fma_dot_f32` when loop is explicitly annotated `@simd` and indices match the loop induction variable
+    std::string ivar = loop_stmt->loop_var;
+    if (ivar.empty() && loop_stmt->c_init) ivar = loop_stmt->c_init->name;
+
+    if (loop_stmt->attr_simd && loop_stmt->body.size() == 1 && !ivar.empty()) {
         Stmt* body0 = loop_stmt->body[0].get();
         if (body0 && body0->kind == StmtKind::Assign && body0->assign_op == "+=" &&
             body0->expr && body0->expr->kind == ExprKind::Binary && body0->expr->str_val == "*") {
             Expr* lhs = body0->expr->lhs.get();
             Expr* rhs = body0->expr->rhs.get();
             if (lhs && rhs && lhs->kind == ExprKind::Index && rhs->kind == ExprKind::Index &&
-                lhs->lhs && rhs->lhs && lhs->lhs->kind == ExprKind::Var && rhs->lhs->kind == ExprKind::Var) {
+                lhs->lhs && rhs->lhs && lhs->lhs->kind == ExprKind::Var && rhs->lhs->kind == ExprKind::Var &&
+                lhs->rhs && rhs->rhs && lhs->rhs->kind == ExprKind::Var && rhs->rhs->kind == ExprKind::Var &&
+                lhs->rhs->str_val == ivar && rhs->rhs->str_val == ivar) {
                 loop_stmt->can_lift_simd_dot = true;
                 loop_stmt->dot_arr_a = lhs->lhs->str_val;
                 loop_stmt->dot_arr_b = rhs->lhs->str_val;
-                stats_.simd_loops_vectorized++;
             }
         }
     }
@@ -206,11 +210,8 @@ ValueType Analyzer::analyze_expr(Expr* ex) {
             return ex->inferred_type;
         }
         case ExprKind::ArrayLit: {
-            bool all_int = !ex->args.empty();
-            for (auto& a : ex->args) {
-                if (analyze_expr(a.get()) != ValueType::I64) all_int = false;
-            }
-            ex->inferred_type = all_int ? ValueType::SliceI64 : ValueType::SliceF64;
+            for (auto& a : ex->args) analyze_expr(a.get());
+            ex->inferred_type = ValueType::SliceF64;
             return ex->inferred_type;
         }
         case ExprKind::MapLit: {

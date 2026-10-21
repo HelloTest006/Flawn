@@ -99,10 +99,651 @@ std::string BytecodeVM::val_to_string(rt::NaNVal v) const {
     return "null";
 }
 
+// ============================================================================
+// Register-Based Bytecode Compiler
+// Compiles arbitrary functions, arithmetic expressions, loops, and branches
+// into a flat register instruction stream (zero hash-table lookups in loops).
+// ============================================================================
+struct FunctionCompiler {
+    CompiledFunction out;
+    std::vector<std::vector<size_t>> break_Fixups;
+    std::vector<std::vector<size_t>> continue_fixups;
+
+    uint16_t get_or_alloc_local(const std::string& name) {
+        auto it = out.local_reg_map.find(name);
+        if (it != out.local_reg_map.end()) return it->second;
+        uint16_t r = out.num_regs++;
+        out.local_reg_map[name] = r;
+        return r;
+    }
+
+    uint16_t alloc_temp() {
+        return out.num_regs++;
+    }
+
+    bool can_compile_expr_pure(const Expr* ex) const {
+        if (!ex) return true;
+        switch (ex->kind) {
+            case ExprKind::IntLit:
+            case ExprKind::FloatLit:
+            case ExprKind::BoolLit:
+            case ExprKind::NullLit:
+                return true;
+            case ExprKind::Var:
+                return out.local_reg_map.find(ex->str_val) != out.local_reg_map.end();
+            case ExprKind::Unary:
+                return can_compile_expr_pure(ex->lhs.get());
+            case ExprKind::Binary:
+                return can_compile_expr_pure(ex->lhs.get()) && can_compile_expr_pure(ex->rhs.get());
+            case ExprKind::Ternary:
+                return can_compile_expr_pure(ex->cond_expr.get()) &&
+                       can_compile_expr_pure(ex->lhs.get()) &&
+                       can_compile_expr_pure(ex->rhs.get());
+            case ExprKind::Index:
+                return can_compile_expr_pure(ex->lhs.get()) && can_compile_expr_pure(ex->rhs.get());
+            default:
+                return false;
+        }
+    }
+
+    uint16_t compile_expr(const Expr* ex, int preferred_dst = -1) {
+        uint16_t dst = (preferred_dst >= 0) ? static_cast<uint16_t>(preferred_dst) : alloc_temp();
+        if (!ex) {
+            out.code.push_back(BytecodeInst{OpCode::LoadImmI64, dst, 0, 0, 0, 0.0});
+            return dst;
+        }
+
+        if (!can_compile_expr_pure(ex)) {
+            int64_t idx = static_cast<int64_t>(out.ast_exprs.size());
+            out.ast_exprs.push_back(ex);
+            out.code.push_back(BytecodeInst{OpCode::EvalAstExpr, dst, 0, 0, idx, 0.0});
+            return dst;
+        }
+
+        switch (ex->kind) {
+            case ExprKind::IntLit:
+                out.code.push_back(BytecodeInst{OpCode::LoadImmI64, dst, 0, 0, ex->int_val, 0.0});
+                return dst;
+            case ExprKind::FloatLit:
+                out.code.push_back(BytecodeInst{OpCode::LoadImmF64, dst, 0, 0, 0, ex->float_val});
+                return dst;
+            case ExprKind::BoolLit:
+                out.code.push_back(BytecodeInst{OpCode::LoadImmI64, dst, 0, 0, ex->bool_val ? 1 : 0, 0.0});
+                return dst;
+            case ExprKind::NullLit:
+                out.code.push_back(BytecodeInst{OpCode::LoadImmI64, dst, 0, 0, 0, 0.0});
+                return dst;
+            case ExprKind::Var: {
+                uint16_t vreg = out.local_reg_map.at(ex->str_val);
+                if (preferred_dst >= 0 && static_cast<uint16_t>(preferred_dst) != vreg) {
+                    out.code.push_back(BytecodeInst{OpCode::Move, dst, vreg, 0, 0, 0.0});
+                    return dst;
+                }
+                return vreg;
+            }
+            case ExprKind::Unary: {
+                uint16_t s1 = compile_expr(ex->lhs.get());
+                OpCode op = (ex->str_val == "-") ? OpCode::Neg : OpCode::Not;
+                out.code.push_back(BytecodeInst{op, dst, s1, 0, 0, 0.0});
+                return dst;
+            }
+            case ExprKind::Index: {
+                uint16_t arr_r = compile_expr(ex->lhs.get());
+                uint16_t idx_r = compile_expr(ex->rhs.get());
+                out.code.push_back(BytecodeInst{OpCode::GetIndex, dst, arr_r, idx_r, 0, 0.0});
+                return dst;
+            }
+            case ExprKind::Ternary: {
+                uint16_t cond_r = compile_expr(ex->cond_expr.get());
+                size_t jfalse_idx = out.code.size();
+                out.code.push_back(BytecodeInst{OpCode::JumpIfFalse, 0, cond_r, 0, 0, 0.0});
+                compile_expr(ex->lhs.get(), dst);
+                size_t jend_idx = out.code.size();
+                out.code.push_back(BytecodeInst{OpCode::Jump, 0, 0, 0, 0, 0.0});
+                out.code[jfalse_idx].imm_i64 = static_cast<int64_t>(out.code.size());
+                compile_expr(ex->rhs.get(), dst);
+                out.code[jend_idx].imm_i64 = static_cast<int64_t>(out.code.size());
+                return dst;
+            }
+            case ExprKind::Binary: {
+                uint16_t l_r = compile_expr(ex->lhs.get());
+                uint16_t r_r = compile_expr(ex->rhs.get());
+                const std::string& s = ex->str_val;
+                OpCode op = OpCode::Add;
+                if (s == "+") op = OpCode::Add;
+                else if (s == "-") op = OpCode::Sub;
+                else if (s == "*") op = OpCode::Mul;
+                else if (s == "/") op = OpCode::Div;
+                else if (s == "//") op = OpCode::FloorDiv;
+                else if (s == "%") op = OpCode::Mod;
+                else if (s == "**") op = OpCode::Pow;
+                else if (s == "&") op = OpCode::BitAnd;
+                else if (s == "|") op = OpCode::BitOr;
+                else if (s == "^") op = OpCode::BitXor;
+                else if (s == "<<") op = OpCode::Shl;
+                else if (s == ">>") op = OpCode::Shr;
+                else if (s == "==") op = OpCode::Eq;
+                else if (s == "!=") op = OpCode::Neq;
+                else if (s == "<") op = OpCode::Lt;
+                else if (s == "<=") op = OpCode::Le;
+                else if (s == ">") op = OpCode::Gt;
+                else if (s == ">=") op = OpCode::Ge;
+                else if (s == "&&") op = OpCode::And;
+                else if (s == "||") op = OpCode::Or;
+                else if (s == "??") op = OpCode::NullCoalesce;
+                out.code.push_back(BytecodeInst{op, dst, l_r, r_r, 0, 0.0});
+                return dst;
+            }
+            default:
+                return dst;
+        }
+    }
+
+    void PreScanLocals(const std::vector<StmtPtr>& stmts) {
+        for (const auto& s : stmts) {
+            if (!s) continue;
+            if (s->kind == StmtKind::VarDecl || (s->kind == StmtKind::Assign && !s->index_expr && s->field_name.empty())) {
+                get_or_alloc_local(s->name);
+            } else if (s->kind == StmtKind::ForRange || s->kind == StmtKind::ForEach) {
+                get_or_alloc_local(s->loop_var);
+                PreScanLocals(s->body);
+            } else if (s->kind == StmtKind::ForCStyle) {
+                if (s->c_init && (s->c_init->kind == StmtKind::VarDecl || s->c_init->kind == StmtKind::Assign)) {
+                    get_or_alloc_local(s->c_init->name);
+                }
+                PreScanLocals(s->body);
+            } else if (s->kind == StmtKind::If) {
+                PreScanLocals(s->body);
+                PreScanLocals(s->else_body);
+            } else if (s->kind == StmtKind::While) {
+                PreScanLocals(s->body);
+            }
+        }
+    }
+
+    void compile_stmt(const Stmt* st) {
+        if (!st) return;
+
+        switch (st->kind) {
+            case StmtKind::VarDecl: {
+                uint16_t dst = get_or_alloc_local(st->name);
+                if (st->expr) {
+                    compile_expr(st->expr.get(), dst);
+                } else {
+                    out.code.push_back(BytecodeInst{OpCode::LoadImmI64, dst, 0, 0, 0, 0.0});
+                }
+                break;
+            }
+            case StmtKind::Assign: {
+                if (!st->field_name.empty()) {
+                    int64_t idx = static_cast<int64_t>(out.ast_stmts.size());
+                    out.ast_stmts.push_back(st);
+                    out.code.push_back(BytecodeInst{OpCode::ExecAstStmt, 0, 0, 0, idx, 0.0});
+                    break;
+                }
+                if (st->index_expr) {
+                    uint16_t arr_r = get_or_alloc_local(st->name);
+                    uint16_t idx_r = compile_expr(st->index_expr.get());
+                    uint16_t val_r = compile_expr(st->expr.get());
+                    int64_t mode = 0;
+                    if (st->assign_op == "+=") mode = 1;
+                    else if (st->assign_op == "-=") mode = 2;
+                    else if (st->assign_op == "*=") mode = 3;
+                    out.code.push_back(BytecodeInst{OpCode::SetIndex, arr_r, idx_r, val_r, mode, 0.0});
+                    break;
+                }
+                uint16_t dst = get_or_alloc_local(st->name);
+                if (st->assign_op == "=") {
+                    compile_expr(st->expr.get(), dst);
+                } else {
+                    uint16_t rhs_r = compile_expr(st->expr.get());
+                    OpCode op = OpCode::Add;
+                    if (st->assign_op == "+=") op = OpCode::Add;
+                    else if (st->assign_op == "-=") op = OpCode::Sub;
+                    else if (st->assign_op == "*=") op = OpCode::Mul;
+                    else if (st->assign_op == "/=") op = OpCode::Div;
+                    out.code.push_back(BytecodeInst{op, dst, dst, rhs_r, 0, 0.0});
+                }
+                break;
+            }
+            case StmtKind::If: {
+                uint16_t cond_r = compile_expr(st->expr.get());
+                size_t jfalse_idx = out.code.size();
+                out.code.push_back(BytecodeInst{OpCode::JumpIfFalse, 0, cond_r, 0, 0, 0.0});
+                for (const auto& b : st->body) compile_stmt(b.get());
+                if (!st->else_body.empty()) {
+                    size_t jend_idx = out.code.size();
+                    out.code.push_back(BytecodeInst{OpCode::Jump, 0, 0, 0, 0, 0.0});
+                    out.code[jfalse_idx].imm_i64 = static_cast<int64_t>(out.code.size());
+                    for (const auto& eb : st->else_body) compile_stmt(eb.get());
+                    out.code[jend_idx].imm_i64 = static_cast<int64_t>(out.code.size());
+                } else {
+                    out.code[jfalse_idx].imm_i64 = static_cast<int64_t>(out.code.size());
+                }
+                break;
+            }
+            case StmtKind::ForRange: {
+                uint16_t ivar = get_or_alloc_local(st->loop_var);
+                compile_expr(st->range_start.get(), ivar);
+                uint16_t stop_r = compile_expr(st->range_stop.get());
+                bool step_is_one = (st->range_step && st->range_step->kind == ExprKind::IntLit && st->range_step->int_val == 1);
+                uint16_t step_r = step_is_one ? 0 : compile_expr(st->range_step.get());
+
+                size_t prep_idx = out.code.size();
+                out.code.push_back(BytecodeInst{OpCode::ForPrep, ivar, stop_r, 0, 0, 0.0});
+                size_t body_start = out.code.size();
+
+                break_Fixups.emplace_back();
+                continue_fixups.emplace_back();
+                for (const auto& b : st->body) compile_stmt(b.get());
+
+                size_t step_pc = out.code.size();
+                for (size_t c_idx : continue_fixups.back()) {
+                    out.code[c_idx].imm_i64 = static_cast<int64_t>(step_pc);
+                }
+                if (step_is_one) {
+                    out.code.push_back(BytecodeInst{OpCode::ForLoopStep1, ivar, stop_r, 0, static_cast<int64_t>(body_start), 0.0});
+                } else {
+                    out.code.push_back(BytecodeInst{OpCode::ForLoopStepN, ivar, stop_r, step_r, static_cast<int64_t>(body_start), 0.0});
+                }
+                size_t loop_exit = out.code.size();
+                out.code[prep_idx].imm_i64 = static_cast<int64_t>(loop_exit);
+                for (size_t b_idx : break_Fixups.back()) {
+                    out.code[b_idx].imm_i64 = static_cast<int64_t>(loop_exit);
+                }
+                break_Fixups.pop_back();
+                continue_fixups.pop_back();
+                break;
+            }
+            case StmtKind::ForCStyle: {
+                compile_stmt(st->c_init.get());
+                size_t cond_pc = out.code.size();
+                uint16_t cond_r = compile_expr(st->c_cond.get());
+                size_t jexit_idx = out.code.size();
+                out.code.push_back(BytecodeInst{OpCode::JumpIfFalse, 0, cond_r, 0, 0, 0.0});
+
+                break_Fixups.emplace_back();
+                continue_fixups.emplace_back();
+                for (const auto& b : st->body) compile_stmt(b.get());
+
+                size_t step_pc = out.code.size();
+                for (size_t c_idx : continue_fixups.back()) {
+                    out.code[c_idx].imm_i64 = static_cast<int64_t>(step_pc);
+                }
+                compile_stmt(st->c_step.get());
+                out.code.push_back(BytecodeInst{OpCode::Jump, 0, 0, 0, static_cast<int64_t>(cond_pc), 0.0});
+
+                size_t loop_exit = out.code.size();
+                out.code[jexit_idx].imm_i64 = static_cast<int64_t>(loop_exit);
+                for (size_t b_idx : break_Fixups.back()) {
+                    out.code[b_idx].imm_i64 = static_cast<int64_t>(loop_exit);
+                }
+                break_Fixups.pop_back();
+                continue_fixups.pop_back();
+                break;
+            }
+            case StmtKind::While: {
+                size_t cond_pc = out.code.size();
+                uint16_t cond_r = compile_expr(st->expr.get());
+                size_t jexit_idx = out.code.size();
+                out.code.push_back(BytecodeInst{OpCode::JumpIfFalse, 0, cond_r, 0, 0, 0.0});
+
+                break_Fixups.emplace_back();
+                continue_fixups.emplace_back();
+                for (const auto& b : st->body) compile_stmt(b.get());
+
+                for (size_t c_idx : continue_fixups.back()) {
+                    out.code[c_idx].imm_i64 = static_cast<int64_t>(cond_pc);
+                }
+                out.code.push_back(BytecodeInst{OpCode::Jump, 0, 0, 0, static_cast<int64_t>(cond_pc), 0.0});
+                size_t loop_exit = out.code.size();
+                out.code[jexit_idx].imm_i64 = static_cast<int64_t>(loop_exit);
+                for (size_t b_idx : break_Fixups.back()) {
+                    out.code[b_idx].imm_i64 = static_cast<int64_t>(loop_exit);
+                }
+                break_Fixups.pop_back();
+                continue_fixups.pop_back();
+                break;
+            }
+            case StmtKind::Break: {
+                if (!break_Fixups.empty()) {
+                    break_Fixups.back().push_back(out.code.size());
+                    out.code.push_back(BytecodeInst{OpCode::Jump, 0, 0, 0, 0, 0.0});
+                }
+                break;
+            }
+            case StmtKind::Continue: {
+                if (!continue_fixups.empty()) {
+                    continue_fixups.back().push_back(out.code.size());
+                    out.code.push_back(BytecodeInst{OpCode::Jump, 0, 0, 0, 0, 0.0});
+                }
+                break;
+            }
+            case StmtKind::Return: {
+                uint16_t r = st->expr ? compile_expr(st->expr.get()) : alloc_temp();
+                if (!st->expr) {
+                    out.code.push_back(BytecodeInst{OpCode::LoadImmI64, r, 0, 0, 0, 0.0});
+                }
+                out.code.push_back(BytecodeInst{OpCode::Return, 0, r, 0, 0, 0.0});
+                break;
+            }
+            default: {
+                int64_t idx = static_cast<int64_t>(out.ast_stmts.size());
+                out.ast_stmts.push_back(st);
+                out.code.push_back(BytecodeInst{OpCode::ExecAstStmt, 0, 0, 0, idx, 0.0});
+                break;
+            }
+        }
+    }
+};
+
+CompiledFunction BytecodeVM::compile_function(const Stmt* fn_stmt) {
+    FunctionCompiler fc;
+    fc.out.name = fn_stmt->name;
+    fc.out.decl_stmt = fn_stmt;
+    fc.out.num_params = static_cast<uint16_t>(fn_stmt->params.size());
+    for (const auto& p : fn_stmt->params) {
+        fc.get_or_alloc_local(p.name);
+    }
+    fc.PreScanLocals(fn_stmt->body);
+    for (const auto& b : fn_stmt->body) {
+        fc.compile_stmt(b.get());
+    }
+    uint16_t z = fc.alloc_temp();
+    fc.out.code.push_back(BytecodeInst{OpCode::LoadImmI64, z, 0, 0, 0, 0.0});
+    fc.out.code.push_back(BytecodeInst{OpCode::Return, 0, z, 0, 0, 0.0});
+    return fc.out;
+}
+
+// ============================================================================
+// Tight Register-Based Bytecode Dispatch Loop
+// Executes any general arithmetic/bitwise/branch/array loop in contiguous
+// 64-bit NaN-boxed registers with zero hash-table overhead.
+// ============================================================================
+FLAWN_HOT rt::NaNVal BytecodeVM::run_compiled_function(
+    const CompiledFunction& fn,
+    const rt::NaNVal* args,
+    size_t nargs)
+{
+    std::vector<rt::NaNVal> regs(fn.num_regs + 4, rt::NaNVal::from_i64(0));
+    rt::NaNVal* FLAWN_RESTRICT R = regs.data();
+
+    for (size_t i = 0; i < fn.num_params; ++i) {
+        if (i < nargs) {
+            R[i] = args[i];
+        } else if (fn.decl_stmt && fn.decl_stmt->params[i].default_val) {
+            std::unordered_map<std::string, rt::NaNVal> dummy;
+            R[i] = eval_expr(fn.decl_stmt->params[i].default_val.get(), dummy);
+        }
+    }
+
+    const BytecodeInst* FLAWN_RESTRICT code = fn.code.data();
+    size_t pc = 0;
+    const size_t code_len = fn.code.size();
+
+    while (pc < code_len) {
+        const BytecodeInst& ins = code[pc++];
+        switch (ins.op) {
+            case OpCode::Nop:
+                break;
+            case OpCode::LoadImmI64:
+                R[ins.dst] = rt::NaNVal::from_i64(ins.imm_i64);
+                break;
+            case OpCode::LoadImmF64:
+                R[ins.dst] = rt::NaNVal::from_double(ins.imm_f64);
+                break;
+            case OpCode::Move:
+                R[ins.dst] = R[ins.src1];
+                break;
+            case OpCode::Add: {
+                rt::NaNVal a = R[ins.src1], b = R[ins.src2];
+                if (a.is_int() && b.is_int()) R[ins.dst] = rt::NaNVal::from_i64(a.as_i64() + b.as_i64());
+                else R[ins.dst] = rt::NaNVal::from_double(a.to_number() + b.to_number());
+                break;
+            }
+            case OpCode::Sub: {
+                rt::NaNVal a = R[ins.src1], b = R[ins.src2];
+                if (a.is_int() && b.is_int()) R[ins.dst] = rt::NaNVal::from_i64(a.as_i64() - b.as_i64());
+                else R[ins.dst] = rt::NaNVal::from_double(a.to_number() - b.to_number());
+                break;
+            }
+            case OpCode::Mul: {
+                rt::NaNVal a = R[ins.src1], b = R[ins.src2];
+                if (a.is_int() && b.is_int()) R[ins.dst] = rt::NaNVal::from_i64(a.as_i64() * b.as_i64());
+                else R[ins.dst] = rt::NaNVal::from_double(a.to_number() * b.to_number());
+                break;
+            }
+            case OpCode::Div: {
+                R[ins.dst] = rt::NaNVal::from_double(R[ins.src1].to_number() / R[ins.src2].to_number());
+                break;
+            }
+            case OpCode::FloorDiv: {
+                rt::NaNVal a = R[ins.src1], b = R[ins.src2];
+                if (a.is_int() && b.is_int()) {
+                    int64_t d = b.as_i64();
+                    R[ins.dst] = rt::NaNVal::from_i64(d != 0 ? (a.as_i64() / d) : 0);
+                } else {
+                    R[ins.dst] = rt::NaNVal::from_i64(static_cast<int64_t>(std::floor(a.to_number() / b.to_number())));
+                }
+                break;
+            }
+            case OpCode::Mod: {
+                rt::NaNVal a = R[ins.src1], b = R[ins.src2];
+                if (a.is_int() && b.is_int()) {
+                    int64_t d = b.as_i64();
+                    R[ins.dst] = rt::NaNVal::from_i64(d != 0 ? (a.as_i64() % d) : 0);
+                } else {
+                    R[ins.dst] = rt::NaNVal::from_double(std::fmod(a.to_number(), b.to_number()));
+                }
+                break;
+            }
+            case OpCode::Pow: {
+                R[ins.dst] = rt::NaNVal::from_double(std::pow(R[ins.src1].to_number(), R[ins.src2].to_number()));
+                break;
+            }
+            case OpCode::BitAnd:
+                R[ins.dst] = rt::NaNVal::from_i64(R[ins.src1].as_i64() & R[ins.src2].as_i64());
+                break;
+            case OpCode::BitOr:
+                R[ins.dst] = rt::NaNVal::from_i64(R[ins.src1].as_i64() | R[ins.src2].as_i64());
+                break;
+            case OpCode::BitXor:
+                R[ins.dst] = rt::NaNVal::from_i64(R[ins.src1].as_i64() ^ R[ins.src2].as_i64());
+                break;
+            case OpCode::Shl:
+                R[ins.dst] = rt::NaNVal::from_i64(R[ins.src1].as_i64() << R[ins.src2].as_i64());
+                break;
+            case OpCode::Shr:
+                R[ins.dst] = rt::NaNVal::from_i64(R[ins.src1].as_i64() >> R[ins.src2].as_i64());
+                break;
+            case OpCode::Eq: {
+                rt::NaNVal a = R[ins.src1], b = R[ins.src2];
+                if (a.is_int() && b.is_int()) R[ins.dst] = rt::NaNVal::from_bool(a.as_i64() == b.as_i64());
+                else R[ins.dst] = rt::NaNVal::from_bool(a.to_number() == b.to_number());
+                break;
+            }
+            case OpCode::Neq: {
+                rt::NaNVal a = R[ins.src1], b = R[ins.src2];
+                if (a.is_int() && b.is_int()) R[ins.dst] = rt::NaNVal::from_bool(a.as_i64() != b.as_i64());
+                else R[ins.dst] = rt::NaNVal::from_bool(a.to_number() != b.to_number());
+                break;
+            }
+            case OpCode::Lt: {
+                rt::NaNVal a = R[ins.src1], b = R[ins.src2];
+                if (a.is_int() && b.is_int()) R[ins.dst] = rt::NaNVal::from_bool(a.as_i64() < b.as_i64());
+                else R[ins.dst] = rt::NaNVal::from_bool(a.to_number() < b.to_number());
+                break;
+            }
+            case OpCode::Le: {
+                rt::NaNVal a = R[ins.src1], b = R[ins.src2];
+                if (a.is_int() && b.is_int()) R[ins.dst] = rt::NaNVal::from_bool(a.as_i64() <= b.as_i64());
+                else R[ins.dst] = rt::NaNVal::from_bool(a.to_number() <= b.to_number());
+                break;
+            }
+            case OpCode::Gt: {
+                rt::NaNVal a = R[ins.src1], b = R[ins.src2];
+                if (a.is_int() && b.is_int()) R[ins.dst] = rt::NaNVal::from_bool(a.as_i64() > b.as_i64());
+                else R[ins.dst] = rt::NaNVal::from_bool(a.to_number() > b.to_number());
+                break;
+            }
+            case OpCode::Ge: {
+                rt::NaNVal a = R[ins.src1], b = R[ins.src2];
+                if (a.is_int() && b.is_int()) R[ins.dst] = rt::NaNVal::from_bool(a.as_i64() >= b.as_i64());
+                else R[ins.dst] = rt::NaNVal::from_bool(a.to_number() >= b.to_number());
+                break;
+            }
+            case OpCode::And: {
+                bool lb = R[ins.src1].is_bool() ? (R[ins.src1].as_i64() != 0) : (R[ins.src1].to_number() != 0.0);
+                bool rb = R[ins.src2].is_bool() ? (R[ins.src2].as_i64() != 0) : (R[ins.src2].to_number() != 0.0);
+                R[ins.dst] = rt::NaNVal::from_bool(lb && rb);
+                break;
+            }
+            case OpCode::Or: {
+                bool lb = R[ins.src1].is_bool() ? (R[ins.src1].as_i64() != 0) : (R[ins.src1].to_number() != 0.0);
+                bool rb = R[ins.src2].is_bool() ? (R[ins.src2].as_i64() != 0) : (R[ins.src2].to_number() != 0.0);
+                R[ins.dst] = rt::NaNVal::from_bool(lb || rb);
+                break;
+            }
+            case OpCode::NullCoalesce: {
+                rt::NaNVal l = R[ins.src1];
+                R[ins.dst] = ((l.bits & rt::NaNVal::TAG_MASK) != rt::NaNVal::TAG_NULL) ? l : R[ins.src2];
+                break;
+            }
+            case OpCode::Neg: {
+                rt::NaNVal v = R[ins.src1];
+                R[ins.dst] = v.is_int() ? rt::NaNVal::from_i64(-v.as_i64()) : rt::NaNVal::from_double(-v.as_double());
+                break;
+            }
+            case OpCode::Not: {
+                rt::NaNVal v = R[ins.src1];
+                bool b = v.is_bool() ? (v.as_i64() != 0) : (v.to_number() != 0.0);
+                R[ins.dst] = rt::NaNVal::from_bool(!b);
+                break;
+            }
+            case OpCode::GetIndex: {
+                rt::NaNVal arr_v = R[ins.src1];
+                rt::NaNVal idx_v = R[ins.src2];
+                if (arr_v.is_ptr() && arr_v.as_ptr()) {
+                    VmHeader* hdr = static_cast<VmHeader*>(arr_v.as_ptr());
+                    if (hdr->kind == VmObjKind::Array) {
+                        VmArray* arr = static_cast<VmArray*>(hdr);
+                        int64_t raw_idx = idx_v.is_int() ? idx_v.as_i64() : static_cast<int64_t>(idx_v.as_double());
+                        if (raw_idx < 0) raw_idx += static_cast<int64_t>(arr->length);
+                        size_t idx = static_cast<size_t>(raw_idx);
+                        if (idx < arr->length) {
+                            if (arr->elem_type == ValueType::F32) R[ins.dst] = rt::NaNVal::from_double(static_cast<float*>(arr->data)[idx]);
+                            else if (arr->elem_type == ValueType::F64) R[ins.dst] = rt::NaNVal::from_double(static_cast<double*>(arr->data)[idx]);
+                            else R[ins.dst] = rt::NaNVal::from_i64(static_cast<int64_t*>(arr->data)[idx]);
+                        }
+                    } else if (hdr->kind == VmObjKind::Map || hdr->kind == VmObjKind::Struct) {
+                        R[ins.dst] = static_cast<VmMap*>(hdr)->get(val_to_string(idx_v));
+                    }
+                }
+                break;
+            }
+            case OpCode::SetIndex: {
+                rt::NaNVal arr_v = R[ins.dst];
+                rt::NaNVal idx_v = R[ins.src1];
+                rt::NaNVal rhs   = R[ins.src2];
+                if (arr_v.is_ptr() && arr_v.as_ptr()) {
+                    VmHeader* hdr = static_cast<VmHeader*>(arr_v.as_ptr());
+                    if (hdr->kind == VmObjKind::Array) {
+                        VmArray* arr = static_cast<VmArray*>(hdr);
+                        int64_t raw_idx = idx_v.is_int() ? idx_v.as_i64() : static_cast<int64_t>(idx_v.as_double());
+                        if (raw_idx < 0) raw_idx += static_cast<int64_t>(arr->length);
+                        size_t idx = static_cast<size_t>(raw_idx);
+                        if (idx < arr->length) {
+                            if (arr->elem_type == ValueType::F32) {
+                                float* p = static_cast<float*>(arr->data);
+                                float fv = static_cast<float>(rhs.to_number());
+                                if (ins.imm_i64 == 0) p[idx] = fv;
+                                else if (ins.imm_i64 == 1) p[idx] += fv;
+                                else if (ins.imm_i64 == 2) p[idx] -= fv;
+                                else if (ins.imm_i64 == 3) p[idx] *= fv;
+                            } else if (arr->elem_type == ValueType::F64) {
+                                double* p = static_cast<double*>(arr->data);
+                                double dv = rhs.to_number();
+                                if (ins.imm_i64 == 0) p[idx] = dv;
+                                else if (ins.imm_i64 == 1) p[idx] += dv;
+                                else if (ins.imm_i64 == 2) p[idx] -= dv;
+                                else if (ins.imm_i64 == 3) p[idx] *= dv;
+                            } else {
+                                int64_t* p = static_cast<int64_t*>(arr->data);
+                                int64_t iv = rhs.is_int() ? rhs.as_i64() : static_cast<int64_t>(rhs.as_double());
+                                if (ins.imm_i64 == 0) p[idx] = iv;
+                                else if (ins.imm_i64 == 1) p[idx] += iv;
+                                else if (ins.imm_i64 == 2) p[idx] -= iv;
+                                else if (ins.imm_i64 == 3) p[idx] *= iv;
+                            }
+                        }
+                    } else if (hdr->kind == VmObjKind::Map || hdr->kind == VmObjKind::Struct) {
+                        static_cast<VmMap*>(hdr)->set(val_to_string(idx_v), rhs);
+                    }
+                }
+                break;
+            }
+            case OpCode::Jump:
+                pc = static_cast<size_t>(ins.imm_i64);
+                break;
+            case OpCode::JumpIfFalse: {
+                rt::NaNVal c = R[ins.src1];
+                bool cond = c.is_bool() ? (c.as_i64() != 0) : (c.to_number() != 0.0);
+                if (!cond) pc = static_cast<size_t>(ins.imm_i64);
+                break;
+            }
+            case OpCode::ForPrep: {
+                int64_t cur = R[ins.dst].is_int() ? R[ins.dst].as_i64() : static_cast<int64_t>(R[ins.dst].to_number());
+                int64_t lim = R[ins.src1].is_int() ? R[ins.src1].as_i64() : static_cast<int64_t>(R[ins.src1].to_number());
+                R[ins.dst] = rt::NaNVal::from_i64(cur);
+                if (cur >= lim) pc = static_cast<size_t>(ins.imm_i64);
+                break;
+            }
+            case OpCode::ForLoopStep1: {
+                int64_t next = R[ins.dst].as_i64() + 1;
+                int64_t lim  = R[ins.src1].is_int() ? R[ins.src1].as_i64() : static_cast<int64_t>(R[ins.src1].to_number());
+                R[ins.dst] = rt::NaNVal::from_i64(next);
+                if (next < lim) pc = static_cast<size_t>(ins.imm_i64);
+                break;
+            }
+            case OpCode::ForLoopStepN: {
+                int64_t step = R[ins.src2].as_i64();
+                int64_t next = R[ins.dst].as_i64() + step;
+                int64_t lim  = R[ins.src1].is_int() ? R[ins.src1].as_i64() : static_cast<int64_t>(R[ins.src1].to_number());
+                R[ins.dst] = rt::NaNVal::from_i64(next);
+                if (step > 0 ? (next < lim) : (next > lim)) pc = static_cast<size_t>(ins.imm_i64);
+                break;
+            }
+            case OpCode::Return:
+                return R[ins.src1];
+            case OpCode::EvalAstExpr: {
+                std::unordered_map<std::string, rt::NaNVal> sync_env;
+                for (const auto& kv : fn.local_reg_map) sync_env[kv.first] = R[kv.second];
+                R[ins.dst] = eval_expr(fn.ast_exprs[static_cast<size_t>(ins.imm_i64)], sync_env);
+                for (const auto& kv : fn.local_reg_map) R[kv.second] = sync_env[kv.first];
+                break;
+            }
+            case OpCode::ExecAstStmt: {
+                std::unordered_map<std::string, rt::NaNVal> sync_env;
+                for (const auto& kv : fn.local_reg_map) sync_env[kv.first] = R[kv.second];
+                exec_stmt(fn.ast_stmts[static_cast<size_t>(ins.imm_i64)], sync_env);
+                for (const auto& kv : fn.local_reg_map) R[kv.second] = sync_env[kv.first];
+                if (has_returned_) {
+                    has_returned_ = false;
+                    return return_val_;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    return rt::NaNVal::null();
+}
+
 void BytecodeVM::execute(const Program& prog) {
     std::cout << std::fixed << std::setprecision(4);
     for (const auto& imp : prog.imports) {
-        if (imp != "fs" && imp != "json" && imp != "http" && imp != "env" && imp != "crypto" && imp != "simd") {
+        if (imp != "math" && imp != "fs" && imp != "json" && imp != "http" && imp != "env" && imp != "crypto" && imp != "simd") {
             py::bridge().import_module(imp);
         }
     }
@@ -110,6 +751,9 @@ void BytecodeVM::execute(const Program& prog) {
         if (!st) continue;
         if (st->kind == StmtKind::FuncDecl) {
             functions_[st->name] = st.get();
+            if (st->name != "main") {
+                compiled_funcs_[st->name] = compile_function(st.get());
+            }
         } else if (st->kind == StmtKind::StructDecl) {
             structs_[st->name] = st.get();
         }
@@ -280,35 +924,6 @@ void BytecodeVM::exec_stmt(const Stmt* st, std::unordered_map<std::string, rt::N
             int64_t stop  = eval_expr(st->range_stop.get(), env).as_i64();
             int64_t step  = eval_expr(st->range_step.get(), env).as_i64();
 
-            if (st->can_lift_simd_dot && step == 1 && start == 0) {
-                VmArray* arr_a = static_cast<VmArray*>(env[st->dot_arr_a].as_ptr());
-                VmArray* arr_b = static_cast<VmArray*>(env[st->dot_arr_b].as_ptr());
-                if (arr_a && arr_b && arr_a->elem_type == ValueType::F32) {
-                    std::string acc_name = st->body[0]->name;
-                    float dot = st->attr_parallel
-                        ? rt::parallel_simd_dot_f32(static_cast<const float*>(arr_a->data), static_cast<const float*>(arr_b->data), static_cast<size_t>(stop))
-                        : rt::simd_fma_dot_f32(static_cast<const float*>(arr_a->data), static_cast<const float*>(arr_b->data), static_cast<size_t>(stop));
-                    double cur = env[acc_name].to_number();
-                    env[acc_name] = rt::NaNVal::from_double(cur + dot);
-                    break;
-                }
-            }
-
-            if (step == 1 && st->body.size() == 1 && st->body[0]->kind == StmtKind::Assign &&
-                st->body[0]->assign_op == "+=") {
-                const Expr* rhs = st->body[0]->expr.get();
-                if (rhs && rhs->kind == ExprKind::Binary && rhs->str_val == "-" &&
-                    rhs->lhs && rhs->lhs->kind == ExprKind::Binary && rhs->lhs->str_val == "*" &&
-                    rhs->rhs && rhs->rhs->kind == ExprKind::Binary && rhs->rhs->str_val == "//") {
-                    int64_t c1 = rhs->lhs->rhs ? rhs->lhs->rhs->int_val : 3;
-                    int64_t c2 = rhs->rhs->rhs ? rhs->rhs->rhs->int_val : 2;
-                    int64_t fast_sum = rt::fast_py_range_linear_loop(stop, c1, c2);
-                    std::string target = st->body[0]->name;
-                    env[target] = rt::NaNVal::from_i64(env[target].as_i64() + fast_sum);
-                    break;
-                }
-            }
-
             for (int64_t i = start; i < stop; i += step) {
                 env[st->loop_var] = rt::NaNVal::from_i64(i);
                 for (const auto& b : st->body) {
@@ -346,19 +961,6 @@ void BytecodeVM::exec_stmt(const Stmt* st, std::unordered_map<std::string, rt::N
         }
         case StmtKind::ForCStyle: {
             exec_stmt(st->c_init.get(), env);
-            if (st->can_lift_simd_dot) {
-                VmArray* arr_a = static_cast<VmArray*>(env[st->dot_arr_a].as_ptr());
-                VmArray* arr_b = static_cast<VmArray*>(env[st->dot_arr_b].as_ptr());
-                if (arr_a && arr_b && arr_a->elem_type == ValueType::F32) {
-                    std::string acc_name = st->body[0]->name;
-                    float dot = st->attr_parallel
-                        ? rt::parallel_simd_dot_f32(static_cast<const float*>(arr_a->data), static_cast<const float*>(arr_b->data), arr_a->length)
-                        : rt::simd_fma_dot_f32(static_cast<const float*>(arr_a->data), static_cast<const float*>(arr_b->data), arr_a->length);
-                    double cur = env[acc_name].to_number();
-                    env[acc_name] = rt::NaNVal::from_double(cur + dot);
-                    break;
-                }
-            }
             while (true) {
                 rt::NaNVal c = eval_expr(st->c_cond.get(), env);
                 bool cond = c.is_bool() ? (c.as_i64() != 0) : (c.to_number() != 0.0);
@@ -502,7 +1104,6 @@ rt::NaNVal BytecodeVM::eval_expr(const Expr* ex, std::unordered_map<std::string,
             return sv;
         }
         case ExprKind::FieldAccess: {
-            // Constants like `math.pi`, `math.e`
             if (ex->obj_name == "math") {
                 if (ex->str_val == "pi" || ex->str_val == "PI") return rt::NaNVal::from_double(3.14159265358979323846);
                 if (ex->str_val == "e" || ex->str_val == "E") return rt::NaNVal::from_double(2.71828182845904523536);
@@ -570,7 +1171,6 @@ rt::NaNVal BytecodeVM::eval_expr(const Expr* ex, std::unordered_map<std::string,
             rt::NaNVal l = eval_expr(ex->lhs.get(), env);
             rt::NaNVal r = eval_expr(ex->rhs.get(), env);
 
-            // String concatenation & equality
             if (l.is_ptr() || r.is_ptr()) {
                 bool l_str = l.is_ptr() && l.as_ptr() && static_cast<VmHeader*>(l.as_ptr())->kind == VmObjKind::String;
                 bool r_str = r.is_ptr() && r.as_ptr() && static_cast<VmHeader*>(r.as_ptr())->kind == VmObjKind::String;
@@ -784,31 +1384,24 @@ rt::NaNVal BytecodeVM::eval_expr(const Expr* ex, std::unordered_map<std::string,
                 return rt::NaNVal::from_double(static_cast<double>(arena_.total_allocated_bytes()) / 1024.0);
             }
 
+            // Execute compiled function on the Register Bytecode VM!
+            auto cfit = compiled_funcs_.find(ex->str_val);
+            if (cfit != compiled_funcs_.end()) {
+                std::vector<rt::NaNVal> arg_vals(ex->args.size());
+                for (size_t i = 0; i < ex->args.size(); ++i) {
+                    arg_vals[i] = eval_expr(ex->args[i].get(), env);
+                }
+                return run_compiled_function(cfit->second, arg_vals.data(), arg_vals.size());
+            }
+
             auto fit = functions_.find(ex->str_val);
             if (fit != functions_.end()) {
-                const Stmt* fn = fit->second;
-                std::unordered_map<std::string, rt::NaNVal> fn_env;
-                for (size_t i = 0; i < fn->params.size(); ++i) {
-                    if (i < ex->args.size()) {
-                        fn_env[fn->params[i].name] = eval_expr(ex->args[i].get(), env);
-                    } else if (fn->params[i].default_val) {
-                        fn_env[fn->params[i].name] = eval_expr(fn->params[i].default_val.get(), env);
-                    } else {
-                        fn_env[fn->params[i].name] = rt::NaNVal::from_i64(0);
-                    }
+                compiled_funcs_[ex->str_val] = compile_function(fit->second);
+                std::vector<rt::NaNVal> arg_vals(ex->args.size());
+                for (size_t i = 0; i < ex->args.size(); ++i) {
+                    arg_vals[i] = eval_expr(ex->args[i].get(), env);
                 }
-                bool prev_ret = has_returned_;
-                rt::NaNVal prev_val = return_val_;
-                has_returned_ = false;
-                return_val_ = rt::NaNVal::null();
-                for (const auto& b : fn->body) {
-                    exec_stmt(b.get(), fn_env);
-                    if (has_returned_) break;
-                }
-                rt::NaNVal res = return_val_;
-                has_returned_ = prev_ret;
-                return_val_ = prev_val;
-                return res;
+                return run_compiled_function(compiled_funcs_[ex->str_val], arg_vals.data(), arg_vals.size());
             }
             return rt::NaNVal::null();
         }
@@ -818,7 +1411,6 @@ rt::NaNVal BytecodeVM::eval_expr(const Expr* ex, std::unordered_map<std::string,
                 arg_vals.push_back(eval_expr(a.get(), env));
             }
 
-            // 1. Built-in Standard Library Modules (`fs`, `json`, `math`, `env`, `crypto`, `time`)
             if (ex->obj_name == "math") {
                 if (arg_vals.size() == 1) {
                     double x = arg_vals[0].to_number();
@@ -869,23 +1461,15 @@ rt::NaNVal BytecodeVM::eval_expr(const Expr* ex, std::unordered_map<std::string,
             }
             if (ex->obj_name == "crypto") {
                 if (ex->str_val == "fnv1a64" && !arg_vals.empty()) {
-                    std::string s = val_to_string(arg_vals[0]);
-                    uint64_t h = 14695981039346656037ULL;
-                    for (unsigned char c : s) {
-                        h ^= c;
-                        h *= 1099511628211ULL;
-                    }
-                    return rt::NaNVal::from_i64(static_cast<int64_t>(h & 0x7FFFFFFFFFFFFFFFULL));
+                    return rt::NaNVal::from_i64(rt::fnv1a64_hash(val_to_string(arg_vals[0])));
                 }
             }
 
-            // 2. Method calls on Array / String / Map objects (`arr.sum()`, `str.upper()`, `map.has()`)
             if (ex->lhs) {
                 rt::NaNVal target = eval_expr(ex->lhs.get(), env);
                 if (target.is_ptr() && target.as_ptr()) {
                     VmHeader* hdr = static_cast<VmHeader*>(target.as_ptr());
 
-                    // Array methods
                     if (hdr->kind == VmObjKind::Array) {
                         VmArray* arr = static_cast<VmArray*>(hdr);
                         if (ex->str_val == "len" || ex->str_val == "size") {
@@ -973,45 +1557,17 @@ rt::NaNVal BytecodeVM::eval_expr(const Expr* ex, std::unordered_map<std::string,
                         }
                     }
 
-                    // String methods
                     if (hdr->kind == VmObjKind::String) {
                         std::string s = val_to_string(target);
                         if (ex->str_val == "len" || ex->str_val == "size") return rt::NaNVal::from_i64(static_cast<int64_t>(s.size()));
-                        if (ex->str_val == "upper") {
-                            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::toupper(c); });
-                            return make_string(s);
-                        }
-                        if (ex->str_val == "lower") {
-                            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
-                            return make_string(s);
-                        }
-                        if (ex->str_val == "trim" || ex->str_val == "strip") {
-                            while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
-                            while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
-                            return make_string(s);
-                        }
-                        if (ex->str_val == "contains" && !arg_vals.empty()) {
-                            return rt::NaNVal::from_bool(s.find(val_to_string(arg_vals[0])) != std::string::npos);
-                        }
-                        if (ex->str_val == "starts_with" && !arg_vals.empty()) {
-                            std::string p = val_to_string(arg_vals[0]);
-                            return rt::NaNVal::from_bool(s.rfind(p, 0) == 0);
-                        }
-                        if (ex->str_val == "replace" && arg_vals.size() >= 2) {
-                            std::string from = val_to_string(arg_vals[0]);
-                            std::string to = val_to_string(arg_vals[1]);
-                            if (!from.empty()) {
-                                size_t pos = 0;
-                                while ((pos = s.find(from, pos)) != std::string::npos) {
-                                    s.replace(pos, from.length(), to);
-                                    pos += to.length();
-                                }
-                            }
-                            return make_string(s);
-                        }
+                        if (ex->str_val == "upper") return make_string(rt::str_upper(s));
+                        if (ex->str_val == "lower") return make_string(rt::str_lower(s));
+                        if (ex->str_val == "trim" || ex->str_val == "strip") return make_string(rt::str_trim(s));
+                        if (ex->str_val == "contains" && !arg_vals.empty()) return rt::NaNVal::from_bool(rt::str_contains(s, val_to_string(arg_vals[0])));
+                        if (ex->str_val == "starts_with" && !arg_vals.empty()) return rt::NaNVal::from_bool(rt::str_starts_with(s, val_to_string(arg_vals[0])));
+                        if (ex->str_val == "replace" && arg_vals.size() >= 2) return make_string(rt::str_replace(s, val_to_string(arg_vals[0]), val_to_string(arg_vals[1])));
                     }
 
-                    // Map / Struct methods
                     if (hdr->kind == VmObjKind::Map || hdr->kind == VmObjKind::Struct) {
                         VmMap* mp = static_cast<VmMap*>(hdr);
                         if ((ex->str_val == "has" || ex->str_val == "contains") && !arg_vals.empty()) {
@@ -1027,7 +1583,6 @@ rt::NaNVal BytecodeVM::eval_expr(const Expr* ex, std::unordered_map<std::string,
                 }
             }
 
-            // 3. Fallback to CPython 3.14 module call (`math.hypot`, `statistics.mean`, etc.)
             return py::bridge().call_module_fn(ex->obj_name, ex->str_val, arg_vals);
         }
     }

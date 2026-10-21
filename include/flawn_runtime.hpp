@@ -8,6 +8,11 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <algorithm>
+#include <sstream>
+#include <fstream>
+#include <filesystem>
+#include <initializer_list>
 #include <immintrin.h>
 #include "flawn_tune_profile.hpp"
 
@@ -526,6 +531,9 @@ inline float parallel_simd_dot_f32(
     const float* FLAWN_RESTRICT b,
     size_t n) noexcept
 {
+    if (n < FLAWN_TUNE_PARALLEL_GRAIN * 2) {
+        return simd_fma_dot_f32(a, b, n);
+    }
     return global_simd_pool().run_dot(a, b, n);
 }
 
@@ -558,40 +566,230 @@ FLAWN_HOT FLAWN_ALWAYS_INLINE int64_t simd_sum_i64(
     return total;
 }
 
-// Closed-form & SIMD Range Polynomial Reducer (turns O(N) Python range loops into O(1) or 8-way AVX2)
-FLAWN_HOT FLAWN_ALWAYS_INLINE int64_t fast_py_range_linear_loop(
-    int64_t n, int64_t mul_coeff, int64_t shift_div) noexcept
-{
-    // Unboxed 4-way unrolled scalar/SIMD pipeline (4-5x+ faster than CPython bytecode loop)
-    // When full loop fidelity is requested (no algebraic shortcut):
-    __m256i acc0 = _mm256_setzero_si256();
-    __m256i acc1 = _mm256_setzero_si256();
-    __m256i idx0 = _mm256_set_epi64x(3, 2, 1, 0);
-    __m256i idx1 = _mm256_set_epi64x(7, 6, 5, 4);
-    __m256i step = _mm256_set1_epi64x(8);
+// ============================================================================
+// 5. First-Class Arena-Backed Vector `FlawnVec<T>` & Dictionary `FlawnMap`
+//    Provides identical semantics (negative indexing, .sum(), .mean(), .dot(),
+//    .push(), .min(), .max()) in both Native AOT C++23 and Bytecode VM.
+// ============================================================================
+template <typename T>
+struct FlawnVec {
+    T* FLAWN_RESTRICT data = nullptr;
+    size_t size_ = 0;
+    size_t capacity_ = 0;
+    SlabArena* arena_ = nullptr;
 
-    int64_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        // i * 3 == (i << 1) + i; i // 2 == i >> 1
-        __m256i term0 = _mm256_sub_epi64(
-            _mm256_add_epi64(_mm256_slli_epi64(idx0, 1), idx0),
-            _mm256_srli_epi64(idx0, 1));
-        __m256i term1 = _mm256_sub_epi64(
-            _mm256_add_epi64(_mm256_slli_epi64(idx1, 1), idx1),
-            _mm256_srli_epi64(idx1, 1));
-        acc0 = _mm256_add_epi64(acc0, term0);
-        acc1 = _mm256_add_epi64(acc1, term1);
-        idx0 = _mm256_add_epi64(idx0, step);
-        idx1 = _mm256_add_epi64(idx1, step);
+    FlawnVec() = default;
+
+    FlawnVec(size_t n, SlabArena* arena)
+        : size_(n), capacity_(std::max<size_t>((n + 15) & ~size_t(15), 16)), arena_(arena) {
+        data = arena_->alloc_array<T>(capacity_);
+        std::memset(data, 0, size_ * sizeof(T));
     }
-    acc0 = _mm256_add_epi64(acc0, acc1);
-    alignas(32) int64_t lanes[4];
-    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), acc0);
-    int64_t total = lanes[0] + lanes[1] + lanes[2] + lanes[3];
-    for (; i < n; ++i) {
-        total += i * mul_coeff - (i / shift_div);
+
+    FlawnVec(std::initializer_list<T> init, SlabArena* arena)
+        : size_(init.size()), capacity_(std::max<size_t>(init.size() * 2, 16)), arena_(arena) {
+        data = arena_->alloc_array<T>(capacity_);
+        size_t i = 0;
+        for (const T& v : init) data[i++] = v;
     }
-    return total;
+
+    FLAWN_ALWAYS_INLINE operator T*() noexcept { return data; }
+    FLAWN_ALWAYS_INLINE operator const T*() const noexcept { return data; }
+
+    FLAWN_ALWAYS_INLINE T& operator[](int64_t idx) noexcept {
+        if (idx < 0) idx += static_cast<int64_t>(size_);
+        return data[static_cast<size_t>(idx)];
+    }
+
+    FLAWN_ALWAYS_INLINE const T& operator[](int64_t idx) const noexcept {
+        if (idx < 0) idx += static_cast<int64_t>(size_);
+        return data[static_cast<size_t>(idx)];
+    }
+
+    FLAWN_ALWAYS_INLINE int64_t len() const noexcept { return static_cast<int64_t>(size_); }
+    FLAWN_ALWAYS_INLINE int64_t size() const noexcept { return static_cast<int64_t>(size_); }
+    FLAWN_ALWAYS_INLINE T* begin() noexcept { return data; }
+    FLAWN_ALWAYS_INLINE T* end() noexcept { return data + size_; }
+    FLAWN_ALWAYS_INLINE const T* begin() const noexcept { return data; }
+    FLAWN_ALWAYS_INLINE const T* end() const noexcept { return data + size_; }
+
+    void push(T val) {
+        if (size_ >= capacity_) {
+            size_t new_cap = std::max<size_t>(capacity_ * 2, 16);
+            T* new_buf = arena_->alloc_array<T>(new_cap);
+            if (size_ > 0 && data) {
+                std::memcpy(new_buf, data, size_ * sizeof(T));
+            }
+            data = new_buf;
+            capacity_ = new_cap;
+        }
+        data[size_++] = val;
+    }
+
+    void append(T val) { push(val); }
+
+    double sum() const noexcept {
+        if constexpr (std::is_same_v<T, int64_t>) {
+            return static_cast<double>(simd_sum_i64(data, size_));
+        } else {
+            double s = 0.0;
+            for (size_t i = 0; i < size_; ++i) s += static_cast<double>(data[i]);
+            return s;
+        }
+    }
+
+    double mean() const noexcept {
+        return size_ == 0 ? 0.0 : (sum() / static_cast<double>(size_));
+    }
+    double avg() const noexcept { return mean(); }
+
+    double min() const noexcept {
+        if (size_ == 0) return 0.0;
+        T m = data[0];
+        for (size_t i = 1; i < size_; ++i) if (data[i] < m) m = data[i];
+        return static_cast<double>(m);
+    }
+
+    double max() const noexcept {
+        if (size_ == 0) return 0.0;
+        T m = data[0];
+        for (size_t i = 1; i < size_; ++i) if (data[i] > m) m = data[i];
+        return static_cast<double>(m);
+    }
+
+    double dot(const FlawnVec<T>& other) const noexcept {
+        size_t n = std::min(size_, other.size_);
+        if constexpr (std::is_same_v<T, float>) {
+            return static_cast<double>(parallel_simd_dot_f32(data, other.data, n));
+        } else {
+            double s = 0.0;
+            for (size_t i = 0; i < n; ++i) s += static_cast<double>(data[i]) * static_cast<double>(other.data[i]);
+            return s;
+        }
+    }
+};
+
+struct FlawnMapVal {
+    enum Kind { Int, Float, Bool, Str } kind = Int;
+    int64_t i_val = 0;
+    double f_val = 0.0;
+    std::string s_val;
+
+    FlawnMapVal() = default;
+    FlawnMapVal(int64_t v) : kind(Int), i_val(v), f_val(static_cast<double>(v)) {}
+    FlawnMapVal(int v) : kind(Int), i_val(v), f_val(static_cast<double>(v)) {}
+    FlawnMapVal(double v) : kind(Float), i_val(static_cast<int64_t>(v)), f_val(v) {}
+    FlawnMapVal(bool v) : kind(Bool), i_val(v ? 1 : 0), f_val(v ? 1.0 : 0.0) {}
+    FlawnMapVal(const std::string& v) : kind(Str), s_val(v) {}
+    FlawnMapVal(const char* v) : kind(Str), s_val(v ? v : "") {}
+
+    operator double() const noexcept { return f_val; }
+    operator int64_t() const noexcept { return i_val; }
+    operator bool() const noexcept { return kind == Str ? !s_val.empty() : (i_val != 0 || f_val != 0.0); }
+
+    bool operator==(int64_t rhs) const noexcept { return i_val == rhs; }
+    bool operator==(double rhs) const noexcept { return f_val == rhs; }
+    bool operator==(const std::string& rhs) const noexcept { return s_val == rhs; }
+    bool operator==(const char* rhs) const noexcept { return s_val == (rhs ? rhs : ""); }
+
+    std::string to_json_val() const {
+        if (kind == Str) return "\"" + s_val + "\"";
+        if (kind == Bool) return i_val ? "true" : "false";
+        if (kind == Int) return std::to_string(i_val);
+        std::ostringstream ss;
+        ss << f_val;
+        return ss.str();
+    }
+};
+
+inline std::ostream& operator<<(std::ostream& os, const FlawnMapVal& v) {
+    if (v.kind == FlawnMapVal::Str) return os << v.s_val;
+    if (v.kind == FlawnMapVal::Bool) return os << (v.i_val ? "true" : "false");
+    if (v.kind == FlawnMapVal::Int) return os << v.i_val;
+    return os << v.f_val;
+}
+
+struct FlawnMap {
+    std::vector<std::pair<std::string, FlawnMapVal>> entries;
+
+    FlawnMap() = default;
+    FlawnMap(std::initializer_list<std::pair<std::string, FlawnMapVal>> init) : entries(init) {}
+
+    FlawnMapVal& operator[](const std::string& k) {
+        for (auto& kv : entries) {
+            if (kv.first == k) return kv.second;
+        }
+        entries.emplace_back(k, FlawnMapVal(0LL));
+        return entries.back().second;
+    }
+
+    FlawnMapVal get(const std::string& k, FlawnMapVal def = FlawnMapVal(0LL)) const {
+        for (const auto& kv : entries) {
+            if (kv.first == k) return kv.second;
+        }
+        return def;
+    }
+
+    bool has(const std::string& k) const {
+        for (const auto& kv : entries) {
+            if (kv.first == k) return true;
+        }
+        return false;
+    }
+    bool contains(const std::string& k) const { return has(k); }
+    int64_t len() const noexcept { return static_cast<int64_t>(entries.size()); }
+
+    std::string to_json() const {
+        std::string out = "{";
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (i > 0) out += ", ";
+            out += "\"" + entries[i].first + "\": " + entries[i].second.to_json_val();
+        }
+        out += "}";
+        return out;
+    }
+};
+
+inline std::ostream& operator<<(std::ostream& os, const FlawnMap& m) {
+    return os << m.to_json();
+}
+
+// String helper intrinsics for AOT C++23 parity
+inline std::string str_upper(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::toupper(c); });
+    return s;
+}
+inline std::string str_lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+    return s;
+}
+inline std::string str_trim(std::string s) {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+    return s;
+}
+inline bool str_contains(const std::string& s, const std::string& sub) {
+    return s.find(sub) != std::string::npos;
+}
+inline bool str_starts_with(const std::string& s, const std::string& prefix) {
+    return s.rfind(prefix, 0) == 0;
+}
+inline std::string str_replace(std::string s, const std::string& from, const std::string& to) {
+    if (from.empty()) return s;
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.length(), to);
+        pos += to.length();
+    }
+    return s;
+}
+inline int64_t fnv1a64_hash(const std::string& s) noexcept {
+    uint64_t h = 14695981039346656037ULL;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return static_cast<int64_t>(h & 0x7FFFFFFFFFFFFFFFULL);
 }
 
 // ============================================================================

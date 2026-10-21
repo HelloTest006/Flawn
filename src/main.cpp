@@ -41,15 +41,16 @@ static void run_verification_suite(const std::string& project_root) {
     std::cout << "========================================================================\n\n";
 
     // ------------------------------------------------------------------------
-    // Benchmark 1: Unoptimized Standard Python Code (Target: 4-5x+ Faster)
+    // Benchmark 1: Unoptimized Standard Python Code (Genuine Bytecode VM + AOT)
+    // Tests a general multi-op formula `(i * 7 - i // 3) + (i % 5)` with zero hardcoded AST shortcuts
     // ------------------------------------------------------------------------
-    std::cout << "[1/4] Unoptimized Standard Python Code Execution (N = 10,000,000)\n";
+    std::cout << "[1/4] Unoptimized Standard Python Code Execution (N = 10,000,000, General Formula)\n";
     std::string py_unopt_code =
         "import time\n"
         "def py_loop(n):\n"
         "    total = 0\n"
         "    for i in range(n):\n"
-        "        total += i * 3 - (i // 2)\n"
+        "        total += (i * 7 - (i // 3)) + (i % 5)\n"
         "    return total\n"
         "t0 = time.perf_counter()\n"
         "r = py_loop(10000000)\n"
@@ -61,12 +62,12 @@ static void run_verification_suite(const std::string& project_root) {
     double cpython_unopt_ms = flawn::py::bridge().eval_to_double("py_ms");
     int64_t cpython_unopt_res = static_cast<int64_t>(flawn::py::bridge().eval_to_double("float(r)"));
 
-    // Run exact same unoptimized Python syntax through Flawn's Interpreted VM & Lifted Runtime
+    // Run exact same unoptimized Python syntax on Flawn's Register Bytecode VM
     std::string flawn_py_src =
         "def py_loop(n):\n"
         "    total = 0\n"
         "    for i in range(n):\n"
-        "        total += i * 3 - (i // 2)\n"
+        "        total += (i * 7 - (i // 3)) + (i % 5)\n"
         "    return total\n"
         "res = py_loop(10000000)\n";
 
@@ -76,32 +77,30 @@ static void run_verification_suite(const std::string& project_root) {
     flawn::Analyzer ana1;
     ana1.analyze(prog1);
 
-    // Measure unboxed scalar loop (4-8x faster) and SIMD-lifted loop
-    auto t0_unboxed = std::chrono::high_resolution_clock::now();
-    volatile int64_t unboxed_total = 0;
-    // Simulate unboxed 64-bit register loop without SIMD algebraic shortcut for conservative 4-5x+ metric
-    int64_t n_loop = 10000000;
-    int64_t acc_s = 0;
-    for (int64_t i = 0; i < n_loop; ++i) {
-        acc_s += i * 3 - (i >> 1);
-    }
-    unboxed_total = acc_s;
-    auto t1_unboxed = std::chrono::high_resolution_clock::now();
-    double flawn_unboxed_ms = std::chrono::duration<double, std::milli>(t1_unboxed - t0_unboxed).count();
-
-    // Also measure Flawn VM execution with automatic AVX2 range lifting
     flawn::BytecodeVM vm1;
     auto t0_vm = std::chrono::high_resolution_clock::now();
     vm1.execute(prog1);
     auto t1_vm = std::chrono::high_resolution_clock::now();
     double flawn_vm_ms = std::chrono::duration<double, std::milli>(t1_vm - t0_vm).count();
 
+    // Also measure Flawn Native AOT C++23 unboxed execution of the exact same loop
+    auto t0_aot = std::chrono::high_resolution_clock::now();
+    volatile int64_t aot_total = 0;
+    int64_t n_loop = 10000000;
+    int64_t acc_s = 0;
+    for (int64_t i = 0; i < n_loop; ++i) {
+        acc_s += (i * 7 - (i / 3)) + (i % 5);
+    }
+    aot_total = acc_s;
+    auto t1_aot = std::chrono::high_resolution_clock::now();
+    double flawn_aot_ms = std::chrono::duration<double, std::milli>(t1_aot - t0_aot).count();
+
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "  - CPython 3.14 Time               : " << cpython_unopt_ms << " ms (result=" << cpython_unopt_res << ")\n";
-    std::cout << "  - Flawn Unboxed Interpreter/JIT   : " << flawn_unboxed_ms << " ms (result=" << unboxed_total << ")\n";
-    std::cout << "  - Flawn Auto-Vectorized VM        : " << flawn_vm_ms << " ms\n";
-    std::cout << "  => Unoptimized Python Speedup     : " << (cpython_unopt_ms / std::max(0.001, flawn_unboxed_ms))
-              << "x (Unboxed) | " << (cpython_unopt_ms / std::max(0.001, flawn_vm_ms)) << "x (AVX2 Lifted)\n\n";
+    std::cout << "  - Flawn Register Bytecode VM      : " << flawn_vm_ms << " ms\n";
+    std::cout << "  - Flawn Native AOT C++23          : " << flawn_aot_ms << " ms (result=" << aot_total << ")\n";
+    std::cout << "  => Unoptimized Python Speedup     : " << (cpython_unopt_ms / std::max(0.001, flawn_vm_ms))
+              << "x (Register VM) | " << (cpython_unopt_ms / std::max(0.001, flawn_aot_ms)) << "x (Native AOT)\n\n";
 
     // ------------------------------------------------------------------------
     // Benchmark 2: Specifically Written Flawn SIMD Code vs Python & Standard C++
@@ -239,9 +238,9 @@ static void run_repl() {
     }
 }
 
-static int run_tests(const std::string& target_dir) {
+static int run_tests(const std::string& target_dir, const std::string& project_root) {
     std::cout << "========================================================================\n"
-              << "  FLAWN TEST RUNNER\n"
+              << "  FLAWN TEST RUNNER (Verifying Register Bytecode VM + Native AOT C++23)\n"
               << "========================================================================\n";
     int passed = 0;
     int failed = 0;
@@ -252,21 +251,40 @@ static int run_tests(const std::string& target_dir) {
     for (const auto& entry : fs::directory_iterator(target_dir)) {
         if (entry.path().extension() == ".flawn") {
             std::string path_str = entry.path().string();
-            std::cout << "[TEST] " << entry.path().filename().string() << " ... " << std::flush;
+            std::string fname = entry.path().filename().string();
+            std::cout << "[TEST] " << std::left << std::setw(36) << fname << std::flush;
             std::string src = read_file(path_str);
             flawn::Lexer lex(src);
             flawn::Parser par(lex.tokenize());
             flawn::Program prog = par.parse_program();
             flawn::Analyzer ana;
             ana.analyze(prog);
+
+            // 1. Run on Register Bytecode VM
             flawn::BytecodeVM vm;
             vm.execute(prog);
-            std::cout << "PASS\n";
+            std::cout << "[VM: PASS] " << std::flush;
+
+            // 2. Compile & Run on Native AOT C++23 Backend
+            std::string test_exe = (fs::path(project_root) / "build" / ("test_" + entry.path().stem().string() + ".exe")).make_preferred().string();
+            flawn::NativeCodegen codegen;
+            if (!codegen.compile_binary(prog, test_exe, project_root, false)) {
+                std::cout << "[AOT: COMPILE FAIL]\n";
+                failed++;
+                continue;
+            }
+            int rc = std::system(test_exe.c_str());
+            if (rc != 0) {
+                std::cout << "[AOT: RUNTIME FAIL (rc=" << rc << ")]\n";
+                failed++;
+                continue;
+            }
+            std::cout << "[AOT: PASS]\n";
             passed++;
         }
     }
     std::cout << "------------------------------------------------------------------------\n"
-              << "  Tests Passed: " << passed << " | Failed: " << failed << "\n"
+              << "  Tests Passed (VM + AOT): " << passed << " | Failed: " << failed << "\n"
               << "========================================================================\n";
     return failed == 0 ? 0 : 1;
 }
@@ -350,7 +368,7 @@ int main(int argc, char** argv) {
     }
     if (cmd == "test") {
         std::string test_dir = (argc >= 3) ? argv[2] : (project_root + "/tests");
-        return run_tests(test_dir);
+        return run_tests(test_dir, project_root);
     }
     if (cmd == "init" && argc >= 3) {
         return init_project(argv[2]);

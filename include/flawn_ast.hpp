@@ -33,9 +33,10 @@ inline std::string type_to_cpp(ValueType t, const std::string& struct_name = "")
         case ValueType::F32:      return "float";
         case ValueType::Bool:     return "bool";
         case ValueType::String:   return "std::string";
-        case ValueType::SliceF32: return "float* FLAWN_RESTRICT";
-        case ValueType::SliceF64: return "double* FLAWN_RESTRICT";
-        case ValueType::SliceI64: return "int64_t* FLAWN_RESTRICT";
+        case ValueType::SliceF32: return "flawn::rt::FlawnVec<float>";
+        case ValueType::SliceF64: return "flawn::rt::FlawnVec<double>";
+        case ValueType::SliceI64: return "flawn::rt::FlawnVec<int64_t>";
+        case ValueType::Map:      return "flawn::rt::FlawnMap";
         case ValueType::Struct:   return struct_name.empty() ? "auto" : struct_name;
         case ValueType::Void:     return "void";
         default:                  return "double";

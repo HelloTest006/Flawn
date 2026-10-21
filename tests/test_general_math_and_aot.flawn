@@ -1,0 +1,86 @@
+// Test 3: General Math Fidelity (Anti-Cheat Verification) & Full AOT/VM Parity
+import math
+import json
+import crypto
+
+// 1. Test multiple distinct Python `def` formulas with varying constants (7, 13, 5, 19)
+//    Verifies that the Register Bytecode VM and AOT Compiler evaluate every instruction
+//    genuinely without any hardcoded formula intercepts.
+def py_formula_alpha(n):
+    total = 0
+    for i in range(n):
+        total += i * 7 - (i // 5)
+    return total
+
+def py_formula_beta(n):
+    total = 0
+    for i in range(n):
+        total += (i * 13 + (i % 7)) - (i // 3)
+    return total
+
+// 2. Branch-heavy Collatz sequence length (cannot be algebraically faked)
+def py_collatz_steps(start_val):
+    n = start_val
+    steps = 0
+    while n > 1:
+        if n % 2 == 0:
+            n = n // 2
+        else:
+            n = 3 * n + 1
+        steps += 1
+    return steps
+
+// 3. Non-dot-product indexed array loop (reverse index `b[n - 1 - i]`)
+fn reverse_weighted_sum(a: f32[], b: f32[], n: usize) -> f64 {
+    let acc: f64 = 0.0;
+    for (let i: usize = 0; i < n; i++) {
+        acc += a[i] * b[n - 1 - i];
+    }
+    return acc;
+}
+
+fn main() -> void {
+    // Verify distinct constants produce exact mathematical results
+    // For n=10:
+    // i=0..9: sum(7*i) = 7 * 45 = 315; sum(i // 5) = 0*5 + 1*5 = 5 -> 315 - 5 = 310
+    let r_alpha: i64 = py_formula_alpha(10);
+    assert r_alpha == 310, "py_formula_alpha(10) corrupted constants!";
+
+    // For n=6:
+    // i=0: 0
+    // i=1: 13 + 1 - 0 = 14
+    // i=2: 26 + 2 - 0 = 28
+    // i=3: 39 + 3 - 1 = 41
+    // i=4: 52 + 4 - 1 = 55
+    // i=5: 65 + 5 - 1 = 69
+    // sum = 0 + 14 + 28 + 41 + 55 + 69 = 207
+    let r_beta: i64 = py_formula_beta(6);
+    assert r_beta == 207, "py_formula_beta(6) corrupted constants!";
+
+    // Collatz(27) takes exactly 111 steps to reach 1
+    let c27: i64 = py_collatz_steps(27);
+    assert c27 == 111, "Collatz(27) step count failed!";
+
+    // Verify reverse-indexed loop `a[i] * b[n - 1 - i]` is not falsely intercepted as `a[i] * b[i]`
+    let n: usize = 4;
+    let va: f32[] = f32[n];
+    let vb: f32[] = f32[n];
+    va[0] = 1.0; va[1] = 2.0; va[2] = 3.0; va[3] = 4.0;
+    vb[0] = 10.0; vb[1] = 20.0; vb[2] = 30.0; vb[3] = 40.0;
+    // Reverse dot: 1*40 + 2*30 + 3*20 + 4*10 = 40 + 60 + 60 + 40 = 200
+    let rev_dot: f64 = reverse_weighted_sum(va, vb, n);
+    assert rev_dot == 200.0, "Reverse-indexed array loop corrupted!";
+
+    // Verify negative indexing, .push(), .sum(), .mean(), and Map methods work in BOTH VM and AOT
+    let scores = [10.0, 20.0, 30.0];
+    scores.push(40.0);
+    assert scores.len() == 4, "scores.len() failed";
+    assert scores[-1] == 40.0, "scores[-1] negative indexing failed";
+    assert scores[-2] == 30.0, "scores[-2] negative indexing failed";
+    assert scores.sum() == 100.0, "scores.sum() failed";
+    assert scores.mean() == 25.0, "scores.mean() failed";
+
+    let cfg = { "port": 8080, "workers": 16 };
+    assert cfg.has("port"), "Map .has() failed";
+    assert cfg["port"] == 8080, "Map indexing failed";
+}

@@ -38,7 +38,12 @@ std::string NativeCodegen::emit_cpp23(const Program& prog, const std::string& ru
     out_ << "}\n";
     out_ << "inline std::string flawn_to_str(const std::string& s) { return s; }\n";
     out_ << "inline std::string flawn_to_str(const char* s) { return s ? std::string(s) : \"\"; }\n";
-    out_ << "inline std::string flawn_to_str(bool b) { return b ? \"true\" : \"false\"; }\n\n";
+    out_ << "inline std::string flawn_to_str(bool b) { return b ? \"true\" : \"false\"; }\n";
+    out_ << "inline std::string flawn_to_str(const flawn::rt::FlawnMap& m) { return m.to_json(); }\n\n";
+    out_ << "template <typename T>\n";
+    out_ << "inline int64_t flawn_len(const flawn::rt::FlawnVec<T>& v) { return v.len(); }\n";
+    out_ << "inline int64_t flawn_len(const std::string& s) { return static_cast<int64_t>(s.size()); }\n";
+    out_ << "inline int64_t flawn_len(const flawn::rt::FlawnMap& m) { return m.len(); }\n\n";
     out_ << "FLAWN_ALWAYS_INLINE double clock_ms() {\n";
     out_ << "    auto now = std::chrono::steady_clock::now().time_since_epoch();\n";
     out_ << "    return std::chrono::duration<double, std::milli>(now).count();\n";
@@ -88,7 +93,7 @@ std::string NativeCodegen::emit_cpp23(const Program& prog, const std::string& ru
     indent();
     out_ << "std::cout << std::fixed << std::setprecision(4);\n";
     for (const auto& imp : prog.imports) {
-        if (imp != "fs" && imp != "json" && imp != "http" && imp != "env" && imp != "crypto" && imp != "simd") {
+        if (imp != "math" && imp != "fs" && imp != "json" && imp != "http" && imp != "env" && imp != "crypto" && imp != "simd") {
             indent();
             out_ << "flawn::py::bridge().import_module(\"" << imp << "\");\n";
         }
@@ -157,20 +162,17 @@ void NativeCodegen::emit_stmt(const Stmt* st, bool inside_main) {
                 if (st->expr->alloc_elem_type == ValueType::F64) elem_cpp = "double";
                 else if (st->expr->alloc_elem_type == ValueType::I64) elem_cpp = "int64_t";
                 std::string len_s = emit_expr(st->expr->lhs.get());
-                out_ << elem_cpp << "* FLAWN_RESTRICT " << st->name
-                     << " = g_flawn_arena.alloc_array<" << elem_cpp << ">(" << len_s << ");\n";
-                indent();
-                out_ << "size_t " << st->name << "_len_ = static_cast<size_t>(" << len_s << ");\n";
+                out_ << "flawn::rt::FlawnVec<" << elem_cpp << "> " << st->name
+                     << "(static_cast<size_t>(" << len_s << "), &g_flawn_arena);\n";
             } else if (st->expr && st->expr->kind == ExprKind::ArrayLit) {
-                size_t n = st->expr->args.size();
-                out_ << "double* FLAWN_RESTRICT " << st->name
-                     << " = g_flawn_arena.alloc_array<double>(" << std::max<size_t>(n, 16) << ");\n";
-                indent();
-                out_ << "size_t " << st->name << "_len_ = " << n << ";\n";
-                for (size_t i = 0; i < n; ++i) {
-                    indent();
-                    out_ << st->name << "[" << i << "] = " << emit_expr(st->expr->args[i].get()) << ";\n";
+                out_ << "flawn::rt::FlawnVec<double> " << st->name << "({";
+                for (size_t i = 0; i < st->expr->args.size(); ++i) {
+                    if (i > 0) out_ << ", ";
+                    out_ << "static_cast<double>(" << emit_expr(st->expr->args[i].get()) << ")";
                 }
+                out_ << "}, &g_flawn_arena);\n";
+            } else if (st->expr && st->expr->kind == ExprKind::MapLit) {
+                out_ << "flawn::rt::FlawnMap " << st->name << " = " << emit_expr(st->expr.get()) << ";\n";
             } else {
                 if (st->is_const) out_ << "const ";
                 out_ << type_to_cpp(st->decl_type, st->struct_type_name) << " " << st->name;
@@ -207,8 +209,9 @@ void NativeCodegen::emit_stmt(const Stmt* st, bool inside_main) {
         }
         case StmtKind::Assert: {
             indent();
+            std::string msg = st->assert_msg ? emit_expr(st->assert_msg.get()) : "\"Assertion failed\"";
             out_ << "if (!(" << emit_expr(st->expr.get()) << ")) { std::cerr << \"[Flawn Assertion Error] Line "
-                 << st->line << "\\n\"; std::exit(1); }\n";
+                 << st->line << ": \" << (" << msg << ") << \"\\n\"; std::exit(1); }\n";
             break;
         }
         case StmtKind::If: {
@@ -264,10 +267,8 @@ void NativeCodegen::emit_stmt(const Stmt* st, bool inside_main) {
         case StmtKind::ForEach: {
             std::string col_s = emit_expr(st->expr.get());
             indent();
-            out_ << "for (size_t _idx = 0; _idx < " << col_s << "_len_; ++_idx) {\n";
+            out_ << "for (auto " << st->loop_var << " : " << col_s << ") {\n";
             indent_level_++;
-            indent();
-            out_ << "auto " << st->loop_var << " = " << col_s << "[_idx];\n";
             for (const auto& b : st->body) emit_stmt(b.get(), inside_main);
             indent_level_--;
             indent();
@@ -280,7 +281,7 @@ void NativeCodegen::emit_stmt(const Stmt* st, bool inside_main) {
                 std::string acc_name = st->body[0]->name;
                 std::string bound_s = (st->c_cond && st->c_cond->rhs)
                     ? emit_expr(st->c_cond->rhs.get())
-                    : (st->dot_arr_a + "_len_");
+                    : (st->dot_arr_a + ".len()");
                 if (st->attr_parallel) {
                     out_ << acc_name << " += flawn::rt::parallel_simd_dot_f32("
                          << st->dot_arr_a << ", " << st->dot_arr_b << ", static_cast<size_t>(" << bound_s << "));\n";
@@ -371,7 +372,7 @@ std::string NativeCodegen::emit_expr(const Expr* ex) {
         case ExprKind::BoolLit:
             return ex->bool_val ? "true" : "false";
         case ExprKind::NullLit:
-            return "0";
+            return "0LL";
         case ExprKind::StringLit: {
             std::string esc = "std::string(\"";
             for (char c : ex->str_val) {
@@ -402,6 +403,15 @@ std::string NativeCodegen::emit_expr(const Expr* ex) {
                 }
             }
             s += ")";
+            return s;
+        }
+        case ExprKind::MapLit: {
+            std::string s = "flawn::rt::FlawnMap{";
+            for (size_t i = 0; i < ex->keys.size() && i < ex->args.size(); ++i) {
+                if (i > 0) s += ", ";
+                s += "{\"" + ex->keys[i] + "\", flawn::rt::FlawnMapVal(" + emit_expr(ex->args[i].get()) + ")}";
+            }
+            s += "}";
             return s;
         }
         case ExprKind::StructInit: {
@@ -454,6 +464,9 @@ std::string NativeCodegen::emit_expr(const Expr* ex) {
                 return "flawn::rt::parallel_simd_dot_f32(" + emit_expr(ex->args[0].get()) + ", " +
                        emit_expr(ex->args[1].get()) + ", static_cast<size_t>(" + emit_expr(ex->args[2].get()) + "))";
             }
+            if (ex->str_val == "len" && !ex->args.empty()) {
+                return "flawn_len(" + emit_expr(ex->args[0].get()) + ")";
+            }
             if (ex->str_val == "abs" && !ex->args.empty()) {
                 return "std::abs(" + emit_expr(ex->args[0].get()) + ")";
             }
@@ -469,6 +482,12 @@ std::string NativeCodegen::emit_expr(const Expr* ex) {
             if (ex->str_val == "str" && !ex->args.empty()) {
                 return "flawn_to_str(" + emit_expr(ex->args[0].get()) + ")";
             }
+            if (ex->str_val == "int" && !ex->args.empty()) {
+                return "static_cast<int64_t>(" + emit_expr(ex->args[0].get()) + ")";
+            }
+            if (ex->str_val == "float" && !ex->args.empty()) {
+                return "static_cast<double>(" + emit_expr(ex->args[0].get()) + ")";
+            }
             std::string s = ex->str_val + "(";
             for (size_t i = 0; i < ex->args.size(); ++i) {
                 if (i > 0) s += ", ";
@@ -478,6 +497,7 @@ std::string NativeCodegen::emit_expr(const Expr* ex) {
             return s;
         }
         case ExprKind::MemberCall: {
+            // 1. Standard library modules (`math`, `json`, `crypto`, `fs`, `env`)
             if (ex->obj_name == "math") {
                 if (ex->args.size() == 1) {
                     std::string a0 = emit_expr(ex->args[0].get());
@@ -495,6 +515,46 @@ std::string NativeCodegen::emit_expr(const Expr* ex) {
                     }
                 }
             }
+            if (ex->obj_name == "json" && (ex->str_val == "stringify" || ex->str_val == "dumps") && !ex->args.empty()) {
+                return "flawn_to_str(" + emit_expr(ex->args[0].get()) + ")";
+            }
+            if (ex->obj_name == "crypto" && ex->str_val == "fnv1a64" && !ex->args.empty()) {
+                return "flawn::rt::fnv1a64_hash(" + emit_expr(ex->args[0].get()) + ")";
+            }
+
+            // 2. Method calls on `FlawnVec<T>`, `FlawnMap`, and `std::string`
+            if (ex->lhs) {
+                std::string target_s = emit_expr(ex->lhs.get());
+                if (ex->str_val == "upper") return "flawn::rt::str_upper(" + target_s + ")";
+                if (ex->str_val == "lower") return "flawn::rt::str_lower(" + target_s + ")";
+                if (ex->str_val == "trim" || ex->str_val == "strip") return "flawn::rt::str_trim(" + target_s + ")";
+                if (ex->str_val == "starts_with" && !ex->args.empty()) {
+                    return "flawn::rt::str_starts_with(" + target_s + ", " + emit_expr(ex->args[0].get()) + ")";
+                }
+                if (ex->str_val == "replace" && ex->args.size() >= 2) {
+                    return "flawn::rt::str_replace(" + target_s + ", " + emit_expr(ex->args[0].get()) + ", " + emit_expr(ex->args[1].get()) + ")";
+                }
+                if (ex->str_val == "contains" && !ex->args.empty()) {
+                    if (ex->lhs->inferred_type == ValueType::String) {
+                        return "flawn::rt::str_contains(" + target_s + ", " + emit_expr(ex->args[0].get()) + ")";
+                    }
+                    return target_s + ".contains(" + emit_expr(ex->args[0].get()) + ")";
+                }
+                if (ex->str_val == "sum" || ex->str_val == "mean" || ex->str_val == "avg" ||
+                    ex->str_val == "min" || ex->str_val == "max" || ex->str_val == "len" ||
+                    ex->str_val == "size" || ex->str_val == "push" || ex->str_val == "append" ||
+                    ex->str_val == "dot" || ex->str_val == "has" || ex->str_val == "get") {
+                    std::string s = target_s + "." + ex->str_val + "(";
+                    for (size_t i = 0; i < ex->args.size(); ++i) {
+                        if (i > 0) s += ", ";
+                        s += emit_expr(ex->args[i].get());
+                    }
+                    s += ")";
+                    return s;
+                }
+            }
+
+            // 3. Fallback to CPython 3.14 module call
             std::string s = "flawn::py::bridge().call_module_fn(\"" + ex->obj_name + "\", \"" + ex->str_val + "\", {";
             for (size_t i = 0; i < ex->args.size(); ++i) {
                 if (i > 0) s += ", ";
