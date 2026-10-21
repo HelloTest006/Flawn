@@ -18,13 +18,11 @@ std::string NativeCodegen::emit_cpp23(const Program& prog, const std::string& ru
     out_ << "#include <iostream>\n";
     out_ << "#include <iomanip>\n";
     out_ << "#include <sstream>\n";
-    out_ << "#include <fstream>\n";
     out_ << "#include <cstdint>\n";
     out_ << "#include <cmath>\n";
     out_ << "#include <string>\n";
     out_ << "#include <vector>\n";
     out_ << "#include <algorithm>\n";
-    out_ << "#include <filesystem>\n";
     out_ << "#include <chrono>\n";
     out_ << "#include \"" << runtime_include_dir << "/flawn_runtime.hpp\"\n";
     out_ << "#include \"" << runtime_include_dir << "/flawn_pybridge.hpp\"\n";
@@ -141,7 +139,7 @@ void NativeCodegen::emit_stmt(const Stmt* st, bool inside_main) {
             out_ << type_to_cpp(st->return_type, st->struct_type_name) << " " << st->name << "(";
             for (size_t i = 0; i < st->params.size(); ++i) {
                 if (i > 0) out_ << ", ";
-                out_ << type_to_cpp(st->params[i].type, st->params[i].struct_type_name) << " " << st->params[i].name;
+                out_ << param_type_to_cpp(st->params[i].type, st->params[i].struct_type_name) << " " << st->params[i].name;
                 if (st->params[i].default_val) {
                     out_ << " = " << emit_expr(st->params[i].default_val.get());
                 }
@@ -585,10 +583,14 @@ bool NativeCodegen::compile_binary(
         ofs << cpp_code;
     }
 
-    std::string pybridge_src = "\"" + project_root + "/src/pybridge.cpp\" ";
+    std::string pybridge_obj = project_root + "/build/pybridge.o";
+    std::ifstream obj_check(pybridge_obj);
+    std::string pybridge_link = obj_check.good()
+        ? ("\"" + pybridge_obj + "\" ")
+        : ("\"" + project_root + "/src/pybridge.cpp\" ");
 
     std::string cmd = "g++ -std=c++23 -O3 -march=native -mavx2 -mfma -ffast-math -funroll-loops -I\"" +
-                      inc_dir + "\" \"" + tmp_cpp + "\" " + pybridge_src + "-o \"" + output_exe_path + "\"";
+                      inc_dir + "\" \"" + tmp_cpp + "\" " + pybridge_link + "-o \"" + output_exe_path + "\"";
     if (verbose) {
         std::cout << "[flawn-aot] " << cmd << "\n";
     }

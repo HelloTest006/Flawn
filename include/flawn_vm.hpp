@@ -103,6 +103,7 @@ enum class OpCode : uint8_t {
     ForPrep,      // Initialize loop: if R[dst] >= R[src1] jump imm_i64
     ForLoopStep1, // R[dst] += 1; if (R[dst] < R[src1]) pc = imm_i64
     ForLoopStepN, // R[dst] += R[src2]; if (R[dst] < R[src1]) pc = imm_i64
+    SimdDotF32,   // R[dst] += simd_dot(R[src1], R[src2], count=R[imm_i64 & 0xFFFF]), bit 16 = parallel
     Return,       // return R[src1]
 
     // High-level / Complex Expr or Stmt Bridge (calls, allocations, F-strings, methods)

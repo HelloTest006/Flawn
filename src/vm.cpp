@@ -323,6 +323,15 @@ struct FunctionCompiler {
                 break;
             }
             case StmtKind::ForRange: {
+                if (st->can_lift_simd_dot) {
+                    uint16_t acc_r  = get_or_alloc_local(st->body[0]->name);
+                    uint16_t arr_a  = get_or_alloc_local(st->dot_arr_a);
+                    uint16_t arr_b  = get_or_alloc_local(st->dot_arr_b);
+                    uint16_t stop_r = compile_expr(st->range_stop.get());
+                    int64_t imm = static_cast<int64_t>(stop_r) | (st->attr_parallel ? (1LL << 16) : 0LL);
+                    out.code.push_back(BytecodeInst{OpCode::SimdDotF32, acc_r, arr_a, arr_b, imm, 0.0});
+                    break;
+                }
                 uint16_t ivar = get_or_alloc_local(st->loop_var);
                 compile_expr(st->range_start.get(), ivar);
                 uint16_t stop_r = compile_expr(st->range_stop.get());
@@ -356,6 +365,17 @@ struct FunctionCompiler {
                 break;
             }
             case StmtKind::ForCStyle: {
+                if (st->can_lift_simd_dot) {
+                    uint16_t acc_r = get_or_alloc_local(st->body[0]->name);
+                    uint16_t arr_a = get_or_alloc_local(st->dot_arr_a);
+                    uint16_t arr_b = get_or_alloc_local(st->dot_arr_b);
+                    uint16_t bound_r = (st->c_cond && st->c_cond->rhs)
+                        ? compile_expr(st->c_cond->rhs.get())
+                        : alloc_temp();
+                    int64_t imm = static_cast<int64_t>(bound_r) | (st->attr_parallel ? (1LL << 16) : 0LL);
+                    out.code.push_back(BytecodeInst{OpCode::SimdDotF32, acc_r, arr_a, arr_b, imm, 0.0});
+                    break;
+                }
                 compile_stmt(st->c_init.get());
                 size_t cond_pc = out.code.size();
                 uint16_t cond_r = compile_expr(st->c_cond.get());
@@ -713,6 +733,31 @@ FLAWN_HOT rt::NaNVal BytecodeVM::run_compiled_function(
                 if (step > 0 ? (next < lim) : (next > lim)) pc = static_cast<size_t>(ins.imm_i64);
                 break;
             }
+            case OpCode::SimdDotF32: {
+                rt::NaNVal va = R[ins.src1];
+                rt::NaNVal vb = R[ins.src2];
+                uint16_t bound_reg = static_cast<uint16_t>(ins.imm_i64 & 0xFFFF);
+                bool is_par = (ins.imm_i64 & (1LL << 16)) != 0;
+                if (va.is_ptr() && vb.is_ptr() && va.as_ptr() && vb.as_ptr()) {
+                    VmArray* arr_a = static_cast<VmArray*>(va.as_ptr());
+                    VmArray* arr_b = static_cast<VmArray*>(vb.as_ptr());
+                    size_t n = static_cast<size_t>(R[bound_reg].is_int() ? R[bound_reg].as_i64() : static_cast<int64_t>(R[bound_reg].to_number()));
+                    if (n == 0 || n > arr_a->length) n = std::min(arr_a->length, arr_b->length);
+                    if (arr_a->elem_type == ValueType::F32 && arr_b->elem_type == ValueType::F32) {
+                        float dot = is_par
+                            ? rt::parallel_simd_dot_f32(static_cast<const float*>(arr_a->data), static_cast<const float*>(arr_b->data), n)
+                            : rt::simd_fma_dot_f32(static_cast<const float*>(arr_a->data), static_cast<const float*>(arr_b->data), n);
+                        R[ins.dst] = rt::NaNVal::from_double(R[ins.dst].to_number() + static_cast<double>(dot));
+                    } else if (arr_a->elem_type == ValueType::F64 && arr_b->elem_type == ValueType::F64) {
+                        const double* da = static_cast<const double*>(arr_a->data);
+                        const double* db = static_cast<const double*>(arr_b->data);
+                        double s = 0.0;
+                        for (size_t i = 0; i < n; ++i) s += da[i] * db[i];
+                        R[ins.dst] = rt::NaNVal::from_double(R[ins.dst].to_number() + s);
+                    }
+                }
+                break;
+            }
             case OpCode::Return:
                 return R[ins.src1];
             case OpCode::EvalAstExpr: {
@@ -924,6 +969,19 @@ void BytecodeVM::exec_stmt(const Stmt* st, std::unordered_map<std::string, rt::N
             int64_t stop  = eval_expr(st->range_stop.get(), env).as_i64();
             int64_t step  = eval_expr(st->range_step.get(), env).as_i64();
 
+            if (st->can_lift_simd_dot && step == 1 && start == 0) {
+                VmArray* arr_a = static_cast<VmArray*>(env[st->dot_arr_a].as_ptr());
+                VmArray* arr_b = static_cast<VmArray*>(env[st->dot_arr_b].as_ptr());
+                if (arr_a && arr_b && arr_a->elem_type == ValueType::F32) {
+                    std::string acc_name = st->body[0]->name;
+                    float dot = st->attr_parallel
+                        ? rt::parallel_simd_dot_f32(static_cast<const float*>(arr_a->data), static_cast<const float*>(arr_b->data), static_cast<size_t>(stop))
+                        : rt::simd_fma_dot_f32(static_cast<const float*>(arr_a->data), static_cast<const float*>(arr_b->data), static_cast<size_t>(stop));
+                    env[acc_name] = rt::NaNVal::from_double(env[acc_name].to_number() + dot);
+                    break;
+                }
+            }
+
             for (int64_t i = start; i < stop; i += step) {
                 env[st->loop_var] = rt::NaNVal::from_i64(i);
                 for (const auto& b : st->body) {
@@ -961,6 +1019,18 @@ void BytecodeVM::exec_stmt(const Stmt* st, std::unordered_map<std::string, rt::N
         }
         case StmtKind::ForCStyle: {
             exec_stmt(st->c_init.get(), env);
+            if (st->can_lift_simd_dot) {
+                VmArray* arr_a = static_cast<VmArray*>(env[st->dot_arr_a].as_ptr());
+                VmArray* arr_b = static_cast<VmArray*>(env[st->dot_arr_b].as_ptr());
+                if (arr_a && arr_b && arr_a->elem_type == ValueType::F32) {
+                    std::string acc_name = st->body[0]->name;
+                    float dot = st->attr_parallel
+                        ? rt::parallel_simd_dot_f32(static_cast<const float*>(arr_a->data), static_cast<const float*>(arr_b->data), arr_a->length)
+                        : rt::simd_fma_dot_f32(static_cast<const float*>(arr_a->data), static_cast<const float*>(arr_b->data), arr_a->length);
+                    env[acc_name] = rt::NaNVal::from_double(env[acc_name].to_number() + dot);
+                    break;
+                }
+            }
             while (true) {
                 rt::NaNVal c = eval_expr(st->c_cond.get(), env);
                 bool cond = c.is_bool() ? (c.as_i64() != 0) : (c.to_number() != 0.0);

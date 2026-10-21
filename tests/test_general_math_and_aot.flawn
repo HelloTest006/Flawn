@@ -39,7 +39,42 @@ fn reverse_weighted_sum(a: f32[], b: f32[], n: usize) -> f64 {
     return acc;
 }
 
+// 4. 64-bit integer accumulation exceeding 48 bits (> 140,737,488,355,327)
+def py_sum_squares(n):
+    total = 0
+    for i in range(n):
+        total += i * i
+    return total
+
+@simd @parallel
+fn compute_energy(a: f32[], b: f32[], n: usize) -> f64 {
+    let acc: f64 = 0.0;
+    for (let i: usize = 0; i < n; i++) {
+        acc += a[i] * b[i];
+    }
+    return acc;
+}
+
 fn main() -> void {
+    // Verify 64-bit integer precision > 48 bits in both VM and AOT:
+    // sum_{i=0}^{499999} i^2 = 41,666,541,666,750,000
+    let sq_500k: i64 = py_sum_squares(500_000);
+    assert sq_500k == 41666541666750000, "64-bit integer >48 bits truncated in py_sum_squares!";
+
+    // Verify 63-bit FNV-1a hash precision > 48 bits in both VM and AOT:
+    let h_sensor: i64 = crypto.fnv1a64("alpha-sensor-7");
+    assert h_sensor == 2355200779780260836, "64-bit FNV-1a hash truncated!";
+    let h_flawn: i64 = crypto.fnv1a64("flawn-api");
+    assert h_flawn == 3833285388480169142, "64-bit FNV-1a hash for flawn-api truncated!";
+
+    // Verify @simd @parallel dot-product inside compiled VM function runs via SimdDotF32 opcode
+    let big_n: usize = 1048576;
+    let ea: f32[] = f32[big_n];
+    let eb: f32[] = f32[big_n];
+    fill_seq_f32(ea, 0.001, big_n);
+    fill_seq_f32(eb, 0.002, big_n);
+    let e_val: f64 = compute_energy(ea, eb, big_n);
+    assert e_val > 700000.0, "@simd compute_energy failed!";
     // Verify distinct constants produce exact mathematical results
     // For n=10:
     // i=0..9: sum(7*i) = 7 * 45 = 315; sum(i // 5) = 0*5 + 1*5 = 5 -> 315 - 5 = 310

@@ -10,8 +10,6 @@
 #include <atomic>
 #include <algorithm>
 #include <sstream>
-#include <fstream>
-#include <filesystem>
 #include <initializer_list>
 #include <immintrin.h>
 #include "flawn_tune_profile.hpp"
@@ -43,20 +41,33 @@ namespace flawn::rt {
 // 1. 64-Bit NaN-Boxed Value Representation (8 Bytes vs CPython 28-32 Bytes)
 // ============================================================================
 // IEEE 754 double NaN space: exponent bits all 1 (0x7FF8000000000000)
-// Tag bits [48..50]:
-//   001: 48-bit signed integer (unboxed inline!)
-//   010: Boolean / Null / Special
-//   011: Arena String / Object pointer (48-bit address)
+// Tag bits [48..51]:
+//   TAG_INT      (0x7FF9): 48-bit signed integer inline ([-140.7T, +140.7T])
+//   TAG_BOOL     (0x7FFA): Boolean
+//   TAG_NULL     (0x7FFB): Null / None
+//   TAG_PTR      (0x7FFC): Arena String / Object pointer (48-bit address)
+//   TAG_INT_WIDE (0x7FFD): Full 64-bit signed integer (>48 bits) via L2-resident ring
 struct alignas(8) NaNVal {
     uint64_t bits;
 
-    static constexpr uint64_t QNAN_MASK = 0x7FF8000000000000ULL;
-    static constexpr uint64_t TAG_INT   = 0x7FF9000000000000ULL;
-    static constexpr uint64_t TAG_BOOL  = 0x7FFA000000000000ULL;
-    static constexpr uint64_t TAG_NULL  = 0x7FFB000000000000ULL;
-    static constexpr uint64_t TAG_PTR   = 0x7FFC000000000000ULL;
+    static constexpr uint64_t QNAN_MASK    = 0x7FF8000000000000ULL;
+    static constexpr uint64_t TAG_INT      = 0x7FF9000000000000ULL;
+    static constexpr uint64_t TAG_BOOL     = 0x7FFA000000000000ULL;
+    static constexpr uint64_t TAG_NULL     = 0x7FFB000000000000ULL;
+    static constexpr uint64_t TAG_PTR      = 0x7FFC000000000000ULL;
+    static constexpr uint64_t TAG_INT_WIDE = 0x7FFD000000000000ULL;
     static constexpr uint64_t PAYLOAD_MASK = 0x0000FFFFFFFFFFFFULL;
-    static constexpr uint64_t TAG_MASK  = 0xFFFF000000000000ULL;
+    static constexpr uint64_t TAG_MASK     = 0xFFFF000000000000ULL;
+
+    static constexpr size_t WIDE_RING_MASK = 65535;
+    static inline int64_t* wide_int_ring() noexcept {
+        static int64_t ring[65536];
+        return ring;
+    }
+    static inline uint32_t& wide_int_cursor() noexcept {
+        static uint32_t cur = 0;
+        return cur;
+    }
 
     FLAWN_ALWAYS_INLINE static NaNVal from_double(double d) noexcept {
         NaNVal v;
@@ -65,7 +76,13 @@ struct alignas(8) NaNVal {
     }
 
     FLAWN_ALWAYS_INLINE static NaNVal from_i64(int64_t i) noexcept {
-        return NaNVal{ TAG_INT | (static_cast<uint64_t>(i) & PAYLOAD_MASK) };
+        // Fast inline path if i fits in signed 48-bit integer: (i << 16) >> 16 == i
+        if (((i << 16) >> 16) == i) [[likely]] {
+            return NaNVal{ TAG_INT | (static_cast<uint64_t>(i) & PAYLOAD_MASK) };
+        }
+        uint32_t slot = (wide_int_cursor()++) & WIDE_RING_MASK;
+        wide_int_ring()[slot] = i;
+        return NaNVal{ TAG_INT_WIDE | static_cast<uint64_t>(slot) };
     }
 
     FLAWN_ALWAYS_INLINE static NaNVal from_bool(bool b) noexcept {
@@ -85,7 +102,8 @@ struct alignas(8) NaNVal {
     }
 
     FLAWN_ALWAYS_INLINE bool is_int() const noexcept {
-        return (bits & TAG_MASK) == TAG_INT;
+        uint64_t t = bits & TAG_MASK;
+        return t == TAG_INT || t == TAG_INT_WIDE;
     }
 
     FLAWN_ALWAYS_INLINE bool is_bool() const noexcept {
@@ -103,6 +121,9 @@ struct alignas(8) NaNVal {
     }
 
     FLAWN_ALWAYS_INLINE int64_t as_i64() const noexcept {
+        if ((bits & TAG_MASK) == TAG_INT_WIDE) [[unlikely]] {
+            return wide_int_ring()[bits & WIDE_RING_MASK];
+        }
         uint64_t raw = bits & PAYLOAD_MASK;
         // Sign-extend 48-bit integer to 64-bit
         if (raw & 0x0000800000000000ULL) {
@@ -461,15 +482,13 @@ public:
                     }
                 }
             });
+            workers_.back().detach();
         }
     }
 
     ~SimdThreadPool() {
-        stop_.store(true, std::memory_order_relaxed);
+        stop_.store(true, std::memory_order_release);
         epoch_.fetch_add(1, std::memory_order_release);
-        for (auto& w : workers_) {
-            if (w.joinable()) w.join();
-        }
     }
 
     FLAWN_HOT float run_dot(const float* FLAWN_RESTRICT a, const float* FLAWN_RESTRICT b, size_t n) noexcept {

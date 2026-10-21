@@ -43,6 +43,18 @@ inline std::string type_to_cpp(ValueType t, const std::string& struct_name = "")
     }
 }
 
+inline std::string param_type_to_cpp(ValueType t, const std::string& struct_name = "") {
+    switch (t) {
+        case ValueType::SliceF32: return "flawn::rt::FlawnVec<float>&";
+        case ValueType::SliceF64: return "flawn::rt::FlawnVec<double>&";
+        case ValueType::SliceI64: return "flawn::rt::FlawnVec<int64_t>&";
+        case ValueType::Map:      return "flawn::rt::FlawnMap&";
+        case ValueType::String:   return "const std::string&";
+        case ValueType::Struct:   return struct_name.empty() ? "auto&" : (struct_name + "&");
+        default:                  return type_to_cpp(t, struct_name);
+    }
+}
+
 struct Expr;
 struct Stmt;
 using ExprPtr = std::unique_ptr<Expr>;
